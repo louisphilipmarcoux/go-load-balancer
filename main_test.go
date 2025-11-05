@@ -16,11 +16,11 @@ import (
 
 const (
 	lbAddr      = "localhost:8080"
-	backendAddr = "localhost:9001" // This now refers to our *one* test backend
+	backendAddr = "localhost:9001"
 	backendID   = "Test-Server-1"
 )
 
-// ... waitForPort function (no changes) ...
+// waitForPort polls a TCP address until it's available or a timeout is reached.
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -40,7 +40,7 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
-// CHANGED: This function is updated to use the new pool
+// TestMain sets up and tears down the servers for testing.
 func TestMain(m *testing.M) {
 	backendListener, err := backend.RunServer("9001", backendID)
 	if err != nil {
@@ -52,14 +52,16 @@ func TestMain(m *testing.M) {
 		}
 	}()
 
-	// CHANGED: Create a test pool pointing to our *one* test backend
 	testPool := &BackendPool{
 		backends: []*Backend{
-			{Addr: backendAddr}, // backendAddr is "localhost:9001"
+			{Addr: backendAddr},
 		},
 	}
 
-	// CHANGED: Call RunLoadBalancer with the new pool
+	// Manually set the backend to healthy for the integration test
+	// Otherwise, GetNextBackend() will return nil
+	testPool.backends[0].SetHealth(true)
+
 	go func() {
 		if err := RunLoadBalancer(":8080", testPool); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("LB exited: %v", err)
@@ -76,7 +78,7 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// ... TestProxyRequest function (no changes) ...
+// TestProxyRequest is the INTEGRATION TEST.
 func TestProxyRequest(t *testing.T) {
 	resp, err := http.Get("http://" + lbAddr)
 	if err != nil {
@@ -99,7 +101,7 @@ func TestProxyRequest(t *testing.T) {
 	}
 }
 
-// ... TestHandleProxy_Unit function (no changes) ...
+// TestHandleProxy_Unit is the UNIT TEST.
 func TestHandleProxy_Unit(t *testing.T) {
 	clientConn, clientPipe := net.Pipe()
 	backendConn, backendPipe := net.Pipe()
@@ -143,48 +145,64 @@ func TestHandleProxy_Unit(t *testing.T) {
 	}
 }
 
-func TestRoundRobin(t *testing.T) {
+// TestHealthAwareRoundRobin is the unit test for Stage 6 logic
+func TestHealthAwareRoundRobin(t *testing.T) {
 	// 1. Setup our test pool
+	b1 := &Backend{Addr: "server1"}
+	b2 := &Backend{Addr: "server2"}
+	b3 := &Backend{Addr: "server3"}
 	pool := &BackendPool{
-		backends: []*Backend{
-			{Addr: "localhost:9001"},
-			{Addr: "localhost:9002"},
-			{Addr: "localhost:9003"},
-		},
+		backends: []*Backend{b1, b2, b3},
 	}
 
-	// 2. Define the expected sequence of addresses
-	expectedAddrs := []string{
-		"localhost:9002", // Starts at 0, first call increments to 1, 1 % 3 = 1
-		"localhost:9003", // Second call increments to 2, 2 % 3 = 2
-		"localhost:9001", // Third call increments to 3, 3 % 3 = 0 (wraps around)
-		"localhost:9002", // Fourth call increments to 4, 4 % 3 = 1
-	}
+	// 2. Set initial health: b1 and b3 are UP, b2 is DOWN
+	b1.SetHealth(true)
+	b2.SetHealth(false)
+	b3.SetHealth(true)
 
-	// 3. Call GetNextBackend() and check the address
+	// 3. Define the expected sequence:
+	// We are removing the ineffectual assignment. This is the only line now.
+	// Logic:
+	// 1st call: p.current=1, index 1 (b2) is DOWN. p.current=2, index 2 (b3) is UP. Return b3.
+	// 2nd call: p.current=3, index 0 (b1) is UP. Return b1.
+	// 3rd call: p.current=4, index 1 (b2) is DOWN. p.current=5, index 2 (b3) is UP. Return b3.
+	// 4th call: p.current=6, index 0 (b1) is UP. Return b1.
+	expectedAddrs := []string{"server3", "server1", "server3", "server1"}
+
 	for _, expected := range expectedAddrs {
 		backend := pool.GetNextBackend()
 		if backend.Addr != expected {
 			t.Errorf("Expected backend %s, but got %s", expected, backend.Addr)
 		}
 	}
+
+	// 4. Test "all down" scenario
+	b1.SetHealth(false)
+	b3.SetHealth(false)
+	if backend := pool.GetNextBackend(); backend != nil {
+		t.Error("Expected nil backend when all are down")
+	}
+
+	// 5. Test recovery
+	b2.SetHealth(true) // Now only b2 is UP
+	if backend := pool.GetNextBackend(); backend.Addr != "server2" {
+		t.Errorf("Expected server2 after recovery, got %s", backend.Addr)
+	}
 }
 
+// TestBackendHealth is the unit test for Stage 5 logic
 func TestBackendHealth(t *testing.T) {
 	b := &Backend{}
 
-	// 1. Check default state (should be false)
 	if b.IsHealthy() {
 		t.Error("Backend should be unhealthy by default")
 	}
 
-	// 2. Set to healthy and check
 	b.SetHealth(true)
 	if !b.IsHealthy() {
 		t.Error("Backend should be healthy after setting to true")
 	}
 
-	// 3. Set to unhealthy and check
 	b.SetHealth(false)
 	if b.IsHealthy() {
 		t.Error("Backend should be unhealthy after setting to false")

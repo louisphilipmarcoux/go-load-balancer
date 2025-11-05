@@ -6,28 +6,23 @@ import (
 	"log"
 	"net"
 	"sync"
-	"time" // NEW: Import time
+	"time"
 )
 
-// NEW: Backend struct is now more complex
 type Backend struct {
 	Addr    string
 	healthy bool
-	// RWMutex allows many goroutines to Read (IsHealthy)
-	// but only one to Write (SetHealth)
-	lock sync.RWMutex
+	lock    sync.RWMutex
 }
 
-// NEW: IsHealthy checks the health status in a thread-safe way
 func (b *Backend) IsHealthy() bool {
-	b.lock.RLock() // Grab a Read-lock
+	b.lock.RLock()
 	defer b.lock.RUnlock()
 	return b.healthy
 }
 
-// NEW: SetHealth updates the health status in a thread-safe way
 func (b *Backend) SetHealth(healthy bool) {
-	b.lock.Lock() // Grab a Write-lock
+	b.lock.Lock()
 	defer b.lock.Unlock()
 	b.healthy = healthy
 }
@@ -38,13 +33,10 @@ type BackendPool struct {
 	lock     sync.Mutex
 }
 
-// NEW: healthCheck is a helper that runs for each backend
 func (p *BackendPool) healthCheck(b *Backend) {
-	// Attempt to connect with a short timeout
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
-		// Connection failed, mark as unhealthy
-		if b.IsHealthy() { // Only log if the state changes
+		if b.IsHealthy() {
 			log.Printf("Backend %s is DOWN", b.Addr)
 			b.SetHealth(false)
 		}
@@ -56,22 +48,18 @@ func (p *BackendPool) healthCheck(b *Backend) {
 		}
 	}()
 
-	// Connection successful, mark as healthy
-	if !b.IsHealthy() { // Only log if the state changes
+	if !b.IsHealthy() {
 		log.Printf("Backend %s is UP", b.Addr)
 		b.SetHealth(true)
 	}
 }
 
-// NEW: StartHealthChecks runs a continuous health check loop
 func (p *BackendPool) StartHealthChecks() {
 	log.Println("Starting health checks...")
-	// Run an initial check on all backends
 	for _, b := range p.backends {
-		go p.healthCheck(b) // Run in a goroutine so they check in parallel
+		go p.healthCheck(b)
 	}
 
-	// Run checks every 5 seconds in a new goroutine
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -84,19 +72,39 @@ func (p *BackendPool) StartHealthChecks() {
 	}()
 }
 
-// GetNextBackend now just does round-robin.
-// It does NOT check for health yet (that's Stage 6).
+// CHANGED: This method now skips unhealthy backends
 func (p *BackendPool) GetNextBackend() *Backend {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	p.current++
-	index := p.current % uint64(len(p.backends))
-	return p.backends[index]
+	// Get the total number of backends
+	numBackends := uint64(len(p.backends))
+	if numBackends == 0 {
+		return nil // No backends in the pool
+	}
+
+	// Loop up to `numBackends` times to find a healthy one
+	// This prevents an infinite loop if all backends are down
+	for i := uint64(0); i < numBackends; i++ {
+		// Increment and wrap the counter
+		p.current++
+		index := p.current % numBackends
+
+		// Get the backend at that index
+		backend := p.backends[index]
+
+		// NEW: Check if this backend is healthy
+		if backend.IsHealthy() {
+			return backend // Found one, return it
+		}
+	}
+
+	// No healthy backends were found
+	return nil
 }
 
+// ... handleProxy function (no changes) ...
 func handleProxy(client, backend net.Conn) {
-	// ... (no changes to this function)
 	defer func() {
 		if err := client.Close(); err != nil {
 			log.Printf("Warning: failed to close client connection: %v", err)
@@ -109,26 +117,32 @@ func handleProxy(client, backend net.Conn) {
 	}()
 
 	log.Printf("Proxying traffic for %s to %s", client.RemoteAddr(), backend.RemoteAddr())
+
 	var wg sync.WaitGroup
 	wg.Add(2)
+
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(backend, client); err != nil {
 			log.Printf("Error copying from client to backend: %v", err)
 		}
 	}()
+
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(client, backend); err != nil {
 			log.Printf("Error copying from backend to client: %v", err)
 		}
 	}()
+
 	wg.Wait()
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
+// ... RunLoadBalancer function (no changes) ...
+// The 'if backend == nil' check we added in Stage 3
+// now handles the case where all backends are down!
 func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
-	// ... (no changes to this function)
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
@@ -176,6 +190,7 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	}
 }
 
+// ... main function (no changes) ...
 func main() {
 	pool := &BackendPool{
 		backends: []*Backend{
@@ -184,8 +199,6 @@ func main() {
 			{Addr: "localhost:9003"},
 		},
 	}
-
-	// NEW: Start the health check goroutine
 	pool.StartHealthChecks()
 
 	if err := RunLoadBalancer(":8080", pool); err != nil {
