@@ -142,3 +142,30 @@ func TestHandleProxy_Unit(t *testing.T) {
 		t.Logf("Warning: failed to close client pipe: %v", err)
 	}
 }
+
+func TestRoundRobin(t *testing.T) {
+	// 1. Setup our test pool
+	pool := &BackendPool{
+		backends: []*Backend{
+			{Addr: "localhost:9001"},
+			{Addr: "localhost:9002"},
+			{Addr: "localhost:9003"},
+		},
+	}
+
+	// 2. Define the expected sequence of addresses
+	expectedAddrs := []string{
+		"localhost:9002", // Starts at 0, first call increments to 1, 1 % 3 = 1
+		"localhost:9003", // Second call increments to 2, 2 % 3 = 2
+		"localhost:9001", // Third call increments to 3, 3 % 3 = 0 (wraps around)
+		"localhost:9002", // Fourth call increments to 4, 4 % 3 = 1
+	}
+
+	// 3. Call GetNextBackend() and check the address
+	for _, expected := range expectedAddrs {
+		backend := pool.GetNextBackend()
+		if backend.Addr != expected {
+			t.Errorf("Expected backend %s, but got %s", expected, backend.Addr)
+		}
+	}
+}
