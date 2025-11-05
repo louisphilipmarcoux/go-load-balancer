@@ -1,21 +1,23 @@
 package backend
 
 import (
-	"errors" // <-- ADD THIS IMPORT
+	"errors"
 	"fmt"
 	"log"
-	"net" // <-- ADD THIS IMPORT
+	"net"
 	"net/http"
 )
 
 // RunServer starts the backend http server on the given port.
-// Notice it's an EXPORTED function (starts with capital 'R').
 func RunServer(port, serverID string) (net.Listener, error) {
 	log.Printf("Starting backend server %s on port %s\n", serverID, port)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Server %s] Received request from %s", serverID, r.RemoteAddr)
-		fmt.Fprintf(w, "Hello from backend server: %s\n", serverID)
+		// Check the error return value.
+		if _, err := fmt.Fprintf(w, "Hello from backend server: %s\n", serverID); err != nil {
+			log.Printf("Warning: failed to write response: %v", err)
+		}
 	})
 
 	listener, err := net.Listen("tcp", ":"+port)
@@ -27,7 +29,7 @@ func RunServer(port, serverID string) (net.Listener, error) {
 	go func() {
 		err := http.Serve(listener, nil)
 
-		// UPDATED: This error is expected when we call listener.Close() in our test.
+		// We expect a net.ErrClosed when the listener is closed,
 		// We check for it and exit gracefully instead of calling log.Fatalf.
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Fatalf("Failed to start server: %v", err)
