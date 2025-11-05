@@ -8,8 +8,30 @@ import (
 	"sync"
 )
 
+// NEW: A struct to hold information about a single backend
+type Backend struct {
+	Addr string
+	// We will add more fields here later (like health status)
+}
+
+// NEW: The BackendPool manages the set of available backends
+type BackendPool struct {
+	backends []*Backend
+	lock     sync.Mutex
+}
+
+// NEW: GetNextBackend is our simple load balancing logic.
+// For Stage 3, it's not "balancing" yet, just returning the first one.
+func (p *BackendPool) GetNextBackend() *Backend {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	// This is not round-robin yet. We'll change this in Stage 4.
+	// For now, just prove the pool structure works.
+	return p.backends[0]
+}
+
 func handleProxy(client, backend net.Conn) {
-	// Check errors on Close
 	defer func() {
 		if err := client.Close(); err != nil {
 			log.Printf("Warning: failed to close client connection: %v", err)
@@ -44,12 +66,12 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-func RunLoadBalancer(listenAddr, backendAddr string) error {
+// CHANGED: The signature now takes a *BackendPool
+func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
 	}
-	// Check error on Close
 	defer func() {
 		if err := listener.Close(); err != nil {
 			log.Printf("Warning: failed to close listener: %v", err)
@@ -70,23 +92,43 @@ func RunLoadBalancer(listenAddr, backendAddr string) error {
 		}
 
 		go func(c net.Conn) {
-			backend, err := net.Dial("tcp", backendAddr)
+			// CHANGED: Get the backend from the pool
+			backend := pool.GetNextBackend()
+			if backend == nil {
+				log.Println("No available backends")
+				if err := c.Close(); err != nil {
+					log.Printf("Warning: failed to close client connection on no backend error: %v", err)
+				}
+				return
+			}
+
+			// CHANGED: Dial the address from the backend struct
+			backendConn, err := net.Dial("tcp", backend.Addr)
 			if err != nil {
 				log.Printf("Failed to connect to backend: %v", err)
-				// Check error on Close
 				if err := c.Close(); err != nil {
 					log.Printf("Warning: failed to close client connection on backend dial error: %v", err)
 				}
 				return
 			}
-			handleProxy(c, backend)
+
+			handleProxy(c, backendConn)
 		}(client)
 	}
 }
 
+// CHANGED: We now create a pool and pass it to the load balancer
 func main() {
-	const backendAddr = "localhost:9001"
-	if err := RunLoadBalancer(":8080", backendAddr); err != nil {
+	// Create and populate the backend pool
+	pool := &BackendPool{
+		backends: []*Backend{
+			{Addr: "localhost:9001"},
+			{Addr: "localhost:9002"},
+			{Addr: "localhost:9003"},
+		},
+	}
+
+	if err := RunLoadBalancer(":8080", pool); err != nil {
 		log.Fatalf("Failed to run load balancer: %v", err)
 	}
 }

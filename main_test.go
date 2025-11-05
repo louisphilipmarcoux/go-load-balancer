@@ -16,10 +16,11 @@ import (
 
 const (
 	lbAddr      = "localhost:8080"
-	backendAddr = "localhost:9001"
+	backendAddr = "localhost:9001" // This now refers to our *one* test backend
 	backendID   = "Test-Server-1"
 )
 
+// ... waitForPort function (no changes) ...
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -29,7 +30,6 @@ func waitForPort(addr string, timeout time.Duration) error {
 
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil && conn != nil {
-			// THE FIX: Check error on Close
 			if err := conn.Close(); err != nil {
 				log.Printf("Warning: failed to close connection during port check: %v", err)
 			}
@@ -40,20 +40,28 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
+// CHANGED: This function is updated to use the new pool
 func TestMain(m *testing.M) {
 	backendListener, err := backend.RunServer("9001", backendID)
 	if err != nil {
 		log.Fatalf("Failed to start backend server: %v", err)
 	}
-	// THE FIX: Check error on Close
 	defer func() {
 		if err := backendListener.Close(); err != nil {
 			log.Printf("Warning: failed to close backend listener: %v", err)
 		}
 	}()
 
+	// CHANGED: Create a test pool pointing to our *one* test backend
+	testPool := &BackendPool{
+		backends: []*Backend{
+			{Addr: backendAddr}, // backendAddr is "localhost:9001"
+		},
+	}
+
+	// CHANGED: Call RunLoadBalancer with the new pool
 	go func() {
-		if err := RunLoadBalancer(":8080", backendAddr); err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := RunLoadBalancer(":8080", testPool); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("LB exited: %v", err)
 		}
 	}()
@@ -68,12 +76,12 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
+// ... TestProxyRequest function (no changes) ...
 func TestProxyRequest(t *testing.T) {
 	resp, err := http.Get("http://" + lbAddr)
 	if err != nil {
 		t.Fatalf("Failed to make request to load balancer: %v", err)
 	}
-	// THE FIX: Check error on Close
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
 			t.Logf("Warning: failed to close response body: %v", err)
@@ -91,6 +99,7 @@ func TestProxyRequest(t *testing.T) {
 	}
 }
 
+// ... TestHandleProxy_Unit function (no changes) ...
 func TestHandleProxy_Unit(t *testing.T) {
 	clientConn, clientPipe := net.Pipe()
 	backendConn, backendPipe := net.Pipe()
@@ -98,7 +107,6 @@ func TestHandleProxy_Unit(t *testing.T) {
 	go handleProxy(clientPipe, backendPipe)
 
 	go func() {
-		// THE FIX: Check error on Close
 		defer func() {
 			if err := backendConn.Close(); err != nil {
 				t.Logf("Warning: failed to close backend pipe: %v", err)
@@ -130,7 +138,6 @@ func TestHandleProxy_Unit(t *testing.T) {
 		t.Fatalf("Client expected 'world', got %q", string(buf))
 	}
 
-	// Check error on Close
 	if err := clientConn.Close(); err != nil {
 		t.Logf("Warning: failed to close client pipe: %v", err)
 	}
