@@ -8,27 +8,32 @@ import (
 	"sync"
 )
 
-// NEW: A struct to hold information about a single backend
 type Backend struct {
 	Addr string
-	// We will add more fields here later (like health status)
 }
 
-// NEW: The BackendPool manages the set of available backends
 type BackendPool struct {
 	backends []*Backend
-	lock     sync.Mutex
+	// NEW: A counter to track the next backend to use
+	current uint64
+	lock    sync.Mutex
 }
 
-// NEW: GetNextBackend is our simple load balancing logic.
-// For Stage 3, it's not "balancing" yet, just returning the first one.
+// CHANGED: This method now implements Round Robin
 func (p *BackendPool) GetNextBackend() *Backend {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	// This is not round-robin yet. We'll change this in Stage 4.
-	// For now, just prove the pool structure works.
-	return p.backends[0]
+	// Increment the counter. We use uint64 to prevent overflow
+	// and let it wrap around naturally.
+	p.current++
+
+	// Use the modulo operator to get an index within the
+	// bounds of the backends slice.
+	index := p.current % uint64(len(p.backends))
+
+	// Return the backend at that index
+	return p.backends[index]
 }
 
 func handleProxy(client, backend net.Conn) {
@@ -66,7 +71,6 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// CHANGED: The signature now takes a *BackendPool
 func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -92,7 +96,6 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 		}
 
 		go func(c net.Conn) {
-			// CHANGED: Get the backend from the pool
 			backend := pool.GetNextBackend()
 			if backend == nil {
 				log.Println("No available backends")
@@ -102,7 +105,6 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 				return
 			}
 
-			// CHANGED: Dial the address from the backend struct
 			backendConn, err := net.Dial("tcp", backend.Addr)
 			if err != nil {
 				log.Printf("Failed to connect to backend: %v", err)
@@ -117,9 +119,7 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	}
 }
 
-// CHANGED: We now create a pool and pass it to the load balancer
 func main() {
-	// Create and populate the backend pool
 	pool := &BackendPool{
 		backends: []*Backend{
 			{Addr: "localhost:9001"},
