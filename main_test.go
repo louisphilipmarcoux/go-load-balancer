@@ -169,3 +169,24 @@ func TestRoundRobin(t *testing.T) {
 		}
 	}
 }
+
+func TestBackendHealth(t *testing.T) {
+	b := &Backend{}
+
+	// 1. Check default state (should be false)
+	if b.IsHealthy() {
+		t.Error("Backend should be unhealthy by default")
+	}
+
+	// 2. Set to healthy and check
+	b.SetHealth(true)
+	if !b.IsHealthy() {
+		t.Error("Backend should be healthy after setting to true")
+	}
+
+	// 3. Set to unhealthy and check
+	b.SetHealth(false)
+	if b.IsHealthy() {
+		t.Error("Backend should be unhealthy after setting to false")
+	}
+}
