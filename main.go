@@ -2,15 +2,57 @@ package main
 
 import (
 	"errors"
-	"hash/fnv" // NEW: Import hash/fnv
+	"fmt" // NEW: Import fmt
+	"hash/fnv"
 	"io"
 	"log"
 	"math"
 	"net"
+	"os" // NEW: Import os
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gopkg.in/yaml.v3" // NEW: Import yaml
 )
+
+// --- NEW: Config Structs ---
+
+// Config struct to hold all our settings
+type Config struct {
+	ListenAddr string           `yaml:"listenAddr"`
+	Strategy   string           `yaml:"strategy"`
+	Backends   []*BackendConfig `yaml:"backends"`
+}
+
+// BackendConfig holds the config for a single backend
+type BackendConfig struct {
+	Addr string `yaml:"addr"`
+	// We'll add 'weight' here in a later stage
+}
+
+// LoadConfig reads and parses the config.yaml file
+func LoadConfig(path string) (*Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open config file: %w", err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Printf("Warning: failed to close config file: %v", err)
+		}
+	}()
+
+	var cfg Config
+	decoder := yaml.NewDecoder(file)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to decode config YAML: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// --- END: Config Structs ---
 
 type Backend struct {
 	Addr        string
@@ -19,36 +61,49 @@ type Backend struct {
 	connections uint64
 }
 
-// ... IsHealthy, SetHealth, IncrementConnections, DecrementConnections, GetConnections (no changes) ...
+// ... Backend methods (no changes) ...
 func (b *Backend) IsHealthy() bool {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
 	return b.healthy
 }
-
 func (b *Backend) SetHealth(healthy bool) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 	b.healthy = healthy
 }
-
 func (b *Backend) IncrementConnections() {
 	atomic.AddUint64(&b.connections, 1)
 }
-
 func (b *Backend) DecrementConnections() {
 	atomic.AddUint64(&b.connections, ^uint64(0))
 }
-
 func (b *Backend) GetConnections() uint64 {
 	return atomic.LoadUint64(&b.connections)
 }
 
 type BackendPool struct {
 	backends []*Backend
+	// NEW: Store the selected strategy
+	strategy string
+	// NEW: We need this counter back for Round Robin
+	current uint64
 }
 
-// ... healthCheck, StartHealthChecks (no changes) ...
+// NEW: NewBackendPool creates a pool from the config
+func NewBackendPool(cfg *Config) *BackendPool {
+	backends := make([]*Backend, 0, len(cfg.Backends))
+	for _, bc := range cfg.Backends {
+		backends = append(backends, &Backend{Addr: bc.Addr})
+	}
+
+	return &BackendPool{
+		backends: backends,
+		strategy: cfg.Strategy,
+	}
+}
+
+// ... healthCheck (no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -63,19 +118,18 @@ func (p *BackendPool) healthCheck(b *Backend) {
 			log.Printf("Warning: failed to close health check connection: %v", err)
 		}
 	}()
-
 	if !b.IsHealthy() {
 		log.Printf("Backend %s is UP", b.Addr)
 		b.SetHealth(true)
 	}
 }
 
+// ... StartHealthChecks (no changes) ...
 func (p *BackendPool) StartHealthChecks() {
 	log.Println("Starting health checks...")
 	for _, b := range p.backends {
 		go p.healthCheck(b)
 	}
-
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -88,17 +142,33 @@ func (p *BackendPool) StartHealthChecks() {
 	}()
 }
 
-// GetNextBackend now just selects the least busy backend.
-// We'll add a *new* method for IP Hashing.
-func (p *BackendPool) GetNextBackend() *Backend {
+// --- Strategy Implementations ---
+
+// GetNextBackendByIP implements IP Hashing
+func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
+	healthyBackends := make([]*Backend, 0)
+	for _, backend := range p.backends {
+		if backend.IsHealthy() {
+			healthyBackends = append(healthyBackends, backend)
+		}
+	}
+	if len(healthyBackends) == 0 {
+		return nil
+	}
+	h := fnv.New32a()
+	h.Write([]byte(ip))
+	index := int(h.Sum32()) % len(healthyBackends)
+	return healthyBackends[index]
+}
+
+// GetNextBackendByLeastConns implements Least Connections
+func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	var bestBackend *Backend
 	minConnections := uint64(math.MaxUint64)
-
 	for _, backend := range p.backends {
 		if !backend.IsHealthy() {
 			continue
 		}
-
 		conns := backend.GetConnections()
 		if conns < minConnections {
 			minConnections = conns
@@ -108,31 +178,44 @@ func (p *BackendPool) GetNextBackend() *Backend {
 	return bestBackend
 }
 
-// NEW: GetNextBackendByIP implements IP Hashing
-func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
-	// First, collect all healthy backends
-	healthyBackends := make([]*Backend, 0)
-	for _, backend := range p.backends {
-		if backend.IsHealthy() {
-			healthyBackends = append(healthyBackends, backend)
-		}
-	}
+// GetNextBackendByRoundRobin implements Round Robin
+func (p *BackendPool) GetNextBackendByRoundRobin() *Backend {
+	// We need a Read Lock here, not a full Lock,
+	// but let's add a sync.RWMutex to the pool first.
+	// For now, let's just use an atomic for the counter.
+	// We'll refactor the lock in a bit.
 
-	if len(healthyBackends) == 0 {
+	// Let's re-add the lock to the pool
+	// ... (see BackendPool struct)
+
+	// This function is complex with concurrent health checks.
+	// Let's simplify and add the lock back.
+
+	// --- REFECTORING BackendPool ---
+	// (See above) ... We'll add the lock back.
+	// And `current` is already there.
+
+	// This is a new refactor. We'll add a new lock
+	// to BackendPool, just for the counter.
+
+	// ... Let's make this simple.
+
+	numBackends := uint64(len(p.backends))
+	if numBackends == 0 {
 		return nil
 	}
 
-	// Create a new FNV-1a hash
-	h := fnv.New32a()
-	// Write the IP string to the hash
-	h.Write([]byte(ip))
-	// Get the 32-bit hash value
-	hashValue := h.Sum32()
+	// Loop to find a healthy one
+	for i := uint64(0); i < numBackends; i++ {
+		// We'll use atomic.AddUint64 to safely increment
+		index := atomic.AddUint64(&p.current, 1) % numBackends
 
-	// Use the hash value to pick a backend
-	index := int(hashValue) % len(healthyBackends)
-
-	return healthyBackends[index]
+		backend := p.backends[index]
+		if backend.IsHealthy() {
+			return backend
+		}
+	}
+	return nil
 }
 
 // ... handleProxy (no changes) ...
@@ -147,33 +230,28 @@ func handleProxy(client, backend net.Conn) {
 			log.Printf("Warning: failed to close backend connection: %v", err)
 		}
 	}()
-
 	log.Printf("Proxying traffic for %s to %s", client.RemoteAddr(), backend.RemoteAddr())
-
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(backend, client); err != nil {
 			log.Printf("Error copying from client to backend: %v", err)
 		}
 	}()
-
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(client, backend); err != nil {
 			log.Printf("Error copying from backend to client: %v", err)
 		}
 	}()
-
 	wg.Wait()
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// CHANGED: We now get the client IP and use GetNextBackendByIP
-func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
-	listener, err := net.Listen("tcp", listenAddr)
+// CHANGED: Now accepts a *Config
+func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
 	}
@@ -183,11 +261,12 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 		}
 	}()
 
-	log.Printf("Load Balancer listening on %s", listenAddr)
+	log.Printf("Load Balancer listening on %s, strategy: %s", cfg.ListenAddr, cfg.Strategy)
 
 	for {
 		client, err := listener.Accept()
 		if err != nil {
+			// ... (error handling, no changes) ...
 			if errors.Is(err, net.ErrClosed) {
 				log.Println("Listener closed.")
 				return nil
@@ -197,18 +276,33 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 		}
 
 		go func(c net.Conn) {
-			// NEW: Get the client's IP address
-			clientIP, _, err := net.SplitHostPort(c.RemoteAddr().String())
-			if err != nil {
-				log.Printf("Failed to get client IP: %v", err)
-				if err := c.Close(); err != nil {
-					log.Printf("Warning: failed to close client connection on IP error: %v", err)
-				}
-				return
-			}
+			// --- NEW: STRATEGY ROUTING ---
+			var backend *Backend
 
-			// CHANGED: Get backend by IP hash
-			backend := pool.GetNextBackendByIP(clientIP)
+			switch pool.strategy {
+			case "ip-hash":
+				clientIP, _, err := net.SplitHostPort(c.RemoteAddr().String())
+				if err != nil {
+					log.Printf("Failed to get client IP: %v", err)
+					if err := c.Close(); err != nil {
+						log.Printf("Warning: failed to close client connection on IP error: %v", err)
+					}
+					return
+				}
+				backend = pool.GetNextBackendByIP(clientIP)
+
+			case "least-connections":
+				backend = pool.GetNextBackendByLeastConns()
+
+			case "round-robin":
+				backend = pool.GetNextBackendByRoundRobin()
+
+			default:
+				// Default to Round Robin
+				backend = pool.GetNextBackendByRoundRobin()
+			}
+			// --- END: STRATEGY ROUTING ---
+
 			if backend == nil {
 				log.Println("No available backends")
 				if err := c.Close(); err != nil {
@@ -217,9 +311,11 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 				return
 			}
 
-			// We are no longer using Least Connections, so remove these
-			// backend.IncrementConnections()
-			// defer backend.DecrementConnections()
+			// For "least-connections", we must inc/dec the counter
+			if pool.strategy == "least-connections" {
+				backend.IncrementConnections()
+				defer backend.DecrementConnections()
+			}
 
 			backendConn, err := net.Dial("tcp", backend.Addr)
 			if err != nil {
@@ -227,7 +323,9 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 				if err := c.Close(); err != nil {
 					log.Printf("Warning: failed to close client connection on backend dial error: %v", err)
 				}
-				// backend.DecrementConnections() // No longer used
+				if pool.strategy == "least-connections" {
+					backend.DecrementConnections() // Must decrement on dial error
+				}
 				return
 			}
 
@@ -236,18 +334,22 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	}
 }
 
-// ... main (no changes) ...
+// CHANGED: Load config and start
 func main() {
-	pool := &BackendPool{
-		backends: []*Backend{
-			{Addr: "localhost:9001"},
-			{Addr: "localhost:9002"},
-			{Addr: "localhost:9003"},
-		},
+	// 1. Load configuration
+	cfg, err := LoadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
+
+	// 2. Create the backend pool from the config
+	pool := NewBackendPool(cfg)
+
+	// 3. Start health checks
 	pool.StartHealthChecks()
 
-	if err := RunLoadBalancer(":8080", pool); err != nil {
+	// 4. Run the load balancer
+	if err := RunLoadBalancer(cfg, pool); err != nil {
 		log.Fatalf("Failed to run load balancer: %v", err)
 	}
 }

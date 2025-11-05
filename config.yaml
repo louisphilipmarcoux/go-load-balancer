@@ -1,0 +1,6 @@
+listenAddr: ":8080"
+strategy: "ip-hash" # Change this to "round-robin" or "least-connections" to test!
+backends:
+  - addr: "localhost:9001"
+  - addr: "localhost:9002"
+  - addr: "localhost:9003"

@@ -21,7 +21,7 @@ jobs:
         with:
           go-version: "1.25" # Use a modern Go version
           cache: true
-          cache-dependency-path: go.mod
+          cache-dependency-path: go.sum
 
       - name: Tidy dependencies
         run: go mod tidy
@@ -40,6 +40,15 @@ jobs:
       - name: Install Linter (golangci-lint)
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+
+      - name: Cache golangci-lint
+        uses: actions/cache@v4
+        with:
+          path: $(go env GOPATH)/bin/golangci-lint
+          # Re-cache only if go.mod changes
+          key: ${{ runner.os }}-golangci-lint-${{ hashFiles('go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-golangci-lint-
 
       - name: Run Linter
         run: |
