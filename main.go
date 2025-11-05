@@ -4,8 +4,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math" // NEW: Import math
 	"net"
 	"sync"
+	"sync/atomic" // NEW: Import atomic
 	"time"
 )
 
@@ -13,8 +15,11 @@ type Backend struct {
 	Addr    string
 	healthy bool
 	lock    sync.RWMutex
+	// NEW: A thread-safe counter for active connections
+	connections uint64
 }
 
+// ... IsHealthy and SetHealth methods (no changes) ...
 func (b *Backend) IsHealthy() bool {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
@@ -27,12 +32,30 @@ func (b *Backend) SetHealth(healthy bool) {
 	b.healthy = healthy
 }
 
-type BackendPool struct {
-	backends []*Backend
-	current  uint64
-	lock     sync.Mutex
+// NEW: Atomically increments the connection counter
+func (b *Backend) IncrementConnections() {
+	atomic.AddUint64(&b.connections, 1)
 }
 
+// NEW: Atomically decrements the connection counter
+func (b *Backend) DecrementConnections() {
+	atomic.AddUint64(&b.connections, ^uint64(0)) // ^uint64(0) is -1 in two's complement
+}
+
+// NEW: Atomically gets the current connection count
+func (b *Backend) GetConnections() uint64 {
+	return atomic.LoadUint64(&b.connections)
+}
+
+type BackendPool struct {
+	backends []*Backend
+	// Note: 'current' is no longer used by GetNextBackend,
+	// but we'll leave it for now.
+	current uint64
+	lock    sync.Mutex
+}
+
+// ... healthCheck and StartHealthChecks methods (no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -72,35 +95,30 @@ func (p *BackendPool) StartHealthChecks() {
 	}()
 }
 
-// CHANGED: This method now skips unhealthy backends
+// CHANGED: This method now implements the Least Connections algorithm
 func (p *BackendPool) GetNextBackend() *Backend {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	var bestBackend *Backend
+	minConnections := uint64(math.MaxUint64) // Start with the highest possible value
 
-	// Get the total number of backends
-	numBackends := uint64(len(p.backends))
-	if numBackends == 0 {
-		return nil // No backends in the pool
-	}
+	// We don't need the pool's main lock here, because we are
+	// only reading the backends slice (which doesn't change)
+	// and the health/connection counters use their own atomic
+	// or RWMutex locks.
 
-	// Loop up to `numBackends` times to find a healthy one
-	// This prevents an infinite loop if all backends are down
-	for i := uint64(0); i < numBackends; i++ {
-		// Increment and wrap the counter
-		p.current++
-		index := p.current % numBackends
+	for _, backend := range p.backends {
+		if !backend.IsHealthy() {
+			continue // Skip unhealthy backends
+		}
 
-		// Get the backend at that index
-		backend := p.backends[index]
-
-		// NEW: Check if this backend is healthy
-		if backend.IsHealthy() {
-			return backend // Found one, return it
+		// Find the backend with the minimum connections
+		conns := backend.GetConnections()
+		if conns < minConnections {
+			minConnections = conns
+			bestBackend = backend
 		}
 	}
 
-	// No healthy backends were found
-	return nil
+	return bestBackend // This will be nil if all backends are down
 }
 
 // ... handleProxy function (no changes) ...
@@ -139,9 +157,7 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// ... RunLoadBalancer function (no changes) ...
-// The 'if backend == nil' check we added in Stage 3
-// now handles the case where all backends are down!
+// CHANGED: We now increment/decrement the connection counter
 func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -176,12 +192,20 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 				return
 			}
 
+			// NEW: Increment counter *before* proxying
+			backend.IncrementConnections()
+			// NEW: Decrement counter *after* proxying is finished
+			// This happens when handleProxy returns (which is when the connection is closed)
+			defer backend.DecrementConnections()
+
 			backendConn, err := net.Dial("tcp", backend.Addr)
 			if err != nil {
 				log.Printf("Failed to connect to backend: %v", err)
 				if err := c.Close(); err != nil {
 					log.Printf("Warning: failed to close client connection on backend dial error: %v", err)
 				}
+				// We must also decrement here, since the connection failed
+				backend.DecrementConnections()
 				return
 			}
 

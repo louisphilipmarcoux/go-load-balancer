@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log" // NEW: Import math
 	"net"
 	"net/http"
 	"strings"
@@ -14,13 +14,14 @@ import (
 	"github.com/louisphilipmarcoux/go-load-balancer/backend"
 )
 
+// ... consts, waitForPort, TestMain, TestProxyRequest, TestHandleProxy_Unit (no changes) ...
+// (These tests are all still valid)
 const (
 	lbAddr      = "localhost:8080"
 	backendAddr = "localhost:9001"
 	backendID   = "Test-Server-1"
 )
 
-// waitForPort polls a TCP address until it's available or a timeout is reached.
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -40,7 +41,6 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
-// TestMain sets up and tears down the servers for testing.
 func TestMain(m *testing.M) {
 	backendListener, err := backend.RunServer("9001", backendID)
 	if err != nil {
@@ -57,9 +57,6 @@ func TestMain(m *testing.M) {
 			{Addr: backendAddr},
 		},
 	}
-
-	// Manually set the backend to healthy for the integration test
-	// Otherwise, GetNextBackend() will return nil
 	testPool.backends[0].SetHealth(true)
 
 	go func() {
@@ -78,7 +75,6 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// TestProxyRequest is the INTEGRATION TEST.
 func TestProxyRequest(t *testing.T) {
 	resp, err := http.Get("http://" + lbAddr)
 	if err != nil {
@@ -101,7 +97,6 @@ func TestProxyRequest(t *testing.T) {
 	}
 }
 
-// TestHandleProxy_Unit is the UNIT TEST.
 func TestHandleProxy_Unit(t *testing.T) {
 	clientConn, clientPipe := net.Pipe()
 	backendConn, backendPipe := net.Pipe()
@@ -145,52 +140,57 @@ func TestHandleProxy_Unit(t *testing.T) {
 	}
 }
 
-// TestHealthAwareRoundRobin is the unit test for Stage 6 logic
-func TestHealthAwareRoundRobin(t *testing.T) {
+// CHANGED: This test is renamed and updated to test Least Connections
+func TestLeastConnections(t *testing.T) {
 	// 1. Setup our test pool
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
 	b3 := &Backend{Addr: "server3"}
+
+	// Set initial health and connections
+	b1.SetHealth(true) // 2 connections
+	b1.IncrementConnections()
+	b1.IncrementConnections()
+
+	b2.SetHealth(true) // 0 connections
+
+	b3.SetHealth(true) // 1 connection
+	b3.IncrementConnections()
+
 	pool := &BackendPool{
 		backends: []*Backend{b1, b2, b3},
 	}
 
-	// 2. Set initial health: b1 and b3 are UP, b2 is DOWN
-	b1.SetHealth(true)
-	b2.SetHealth(false)
-	b3.SetHealth(true)
-
-	// 3. Define the expected sequence:
-	// We are removing the ineffectual assignment. This is the only line now.
-	// Logic:
-	// 1st call: p.current=1, index 1 (b2) is DOWN. p.current=2, index 2 (b3) is UP. Return b3.
-	// 2nd call: p.current=3, index 0 (b1) is UP. Return b1.
-	// 3rd call: p.current=4, index 1 (b2) is DOWN. p.current=5, index 2 (b3) is UP. Return b3.
-	// 4th call: p.current=6, index 0 (b1) is UP. Return b1.
-	expectedAddrs := []string{"server3", "server1", "server3", "server1"}
-
-	for _, expected := range expectedAddrs {
-		backend := pool.GetNextBackend()
-		if backend.Addr != expected {
-			t.Errorf("Expected backend %s, but got %s", expected, backend.Addr)
-		}
+	// 2. Test initial selection
+	// b2 has 0 conns, b3 has 1, b1 has 2.
+	// It should pick b2.
+	be := pool.GetNextBackend()
+	if be.Addr != "server2" {
+		t.Errorf("Expected backend server2, but got %s", be.Addr)
 	}
+
+	// 3. Test after load is balanced
+	// Let's "add" a connection to b2
+	be.IncrementConnections() // b2 now has 1 conn
+
+	// b2 has 1 conn, b3 has 1, b1 has 2.
+	// It should pick b2 or b3.
+	be = pool.GetNextBackend()
+	if be.Addr != "server2" && be.Addr != "server3" {
+		t.Errorf("Expected backend server2 or server3, but got %s", be.Addr)
+	}
+	be.IncrementConnections() // b2 or b3 now has 2 conns
 
 	// 4. Test "all down" scenario
 	b1.SetHealth(false)
+	b2.SetHealth(false)
 	b3.SetHealth(false)
 	if backend := pool.GetNextBackend(); backend != nil {
 		t.Error("Expected nil backend when all are down")
 	}
-
-	// 5. Test recovery
-	b2.SetHealth(true) // Now only b2 is UP
-	if backend := pool.GetNextBackend(); backend.Addr != "server2" {
-		t.Errorf("Expected server2 after recovery, got %s", backend.Addr)
-	}
 }
 
-// TestBackendHealth is the unit test for Stage 5 logic
+// ... TestBackendHealth function (no changes) ...
 func TestBackendHealth(t *testing.T) {
 	b := &Backend{}
 
