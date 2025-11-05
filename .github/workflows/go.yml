@@ -1,0 +1,45 @@
+name: Go CI
+
+# Run on every push to 'main' or any pull request
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  # Job to lint, format, and test your code
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21' # Use a modern Go version
+
+    - name: Tidy dependencies
+      run: go mod tidy
+
+    - name: Check Formatting
+      run: |
+        # gofmt -ci exits with non-zero if files need formatting
+        gofmt -ci .
+        if [ $? -ne 0 ]; then
+          echo "Go files are not formatted. Please run 'gofmt -w .'"
+          exit 1
+        fi
+
+    - name: Install Linter (golangci-lint)
+      run: |
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.55.2
+
+    - name: Run Linter
+      run: |
+        $(go env GOPATH)/bin/golangci-lint run ./...
+
+    - name: Run Tests
+      run: go test -v -race ./...

@@ -1,0 +1,9 @@
+# Compiled binaries
+go-load-balancer
+backend/backend
+
+# Log files
+*.log
+
+# OS-specific
+.DS_Store
