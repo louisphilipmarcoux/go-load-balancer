@@ -4,22 +4,20 @@ import (
 	"errors"
 	"io"
 	"log"
-	"math" // NEW: Import math
+	"math"
 	"net"
 	"sync"
-	"sync/atomic" // NEW: Import atomic
+	"sync/atomic"
 	"time"
 )
 
 type Backend struct {
-	Addr    string
-	healthy bool
-	lock    sync.RWMutex
-	// NEW: A thread-safe counter for active connections
+	Addr        string
+	healthy     bool
+	lock        sync.RWMutex
 	connections uint64
 }
 
-// ... IsHealthy and SetHealth methods (no changes) ...
 func (b *Backend) IsHealthy() bool {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
@@ -32,30 +30,23 @@ func (b *Backend) SetHealth(healthy bool) {
 	b.healthy = healthy
 }
 
-// NEW: Atomically increments the connection counter
 func (b *Backend) IncrementConnections() {
 	atomic.AddUint64(&b.connections, 1)
 }
 
-// NEW: Atomically decrements the connection counter
 func (b *Backend) DecrementConnections() {
-	atomic.AddUint64(&b.connections, ^uint64(0)) // ^uint64(0) is -1 in two's complement
+	atomic.AddUint64(&b.connections, ^uint64(0))
 }
 
-// NEW: Atomically gets the current connection count
 func (b *Backend) GetConnections() uint64 {
 	return atomic.LoadUint64(&b.connections)
 }
 
+// CHANGED: Removed the 'current' and 'lock' fields
 type BackendPool struct {
 	backends []*Backend
-	// Note: 'current' is no longer used by GetNextBackend,
-	// but we'll leave it for now.
-	current uint64
-	lock    sync.Mutex
 }
 
-// ... healthCheck and StartHealthChecks methods (no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -95,22 +86,15 @@ func (p *BackendPool) StartHealthChecks() {
 	}()
 }
 
-// CHANGED: This method now implements the Least Connections algorithm
 func (p *BackendPool) GetNextBackend() *Backend {
 	var bestBackend *Backend
-	minConnections := uint64(math.MaxUint64) // Start with the highest possible value
-
-	// We don't need the pool's main lock here, because we are
-	// only reading the backends slice (which doesn't change)
-	// and the health/connection counters use their own atomic
-	// or RWMutex locks.
+	minConnections := uint64(math.MaxUint64)
 
 	for _, backend := range p.backends {
 		if !backend.IsHealthy() {
-			continue // Skip unhealthy backends
+			continue
 		}
 
-		// Find the backend with the minimum connections
 		conns := backend.GetConnections()
 		if conns < minConnections {
 			minConnections = conns
@@ -118,10 +102,9 @@ func (p *BackendPool) GetNextBackend() *Backend {
 		}
 	}
 
-	return bestBackend // This will be nil if all backends are down
+	return bestBackend
 }
 
-// ... handleProxy function (no changes) ...
 func handleProxy(client, backend net.Conn) {
 	defer func() {
 		if err := client.Close(); err != nil {
@@ -157,7 +140,6 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// CHANGED: We now increment/decrement the connection counter
 func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -192,10 +174,7 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 				return
 			}
 
-			// NEW: Increment counter *before* proxying
 			backend.IncrementConnections()
-			// NEW: Decrement counter *after* proxying is finished
-			// This happens when handleProxy returns (which is when the connection is closed)
 			defer backend.DecrementConnections()
 
 			backendConn, err := net.Dial("tcp", backend.Addr)
@@ -214,7 +193,6 @@ func RunLoadBalancer(listenAddr string, pool *BackendPool) error {
 	}
 }
 
-// ... main function (no changes) ...
 func main() {
 	pool := &BackendPool{
 		backends: []*Backend{
