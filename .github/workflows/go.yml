@@ -52,7 +52,7 @@ jobs:
 
       - name: Run Linter
         run: |
-          $(go env GOPATH)/bin/golangci-lint run ./...
+          ~go/bin/golangci-lint run ./...
 
       - name: Generate Test Certs
         run: |
