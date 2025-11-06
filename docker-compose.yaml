@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # -------------------
   # The Load Balancer
@@ -30,10 +28,14 @@ services:
       - LOG_LEVEL=${LOG_LEVEL}
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - AUTOCERT_EMAIL=${AUTOCERT_EMAIL}
+      - REDIS_ADDR=redis:6379 # <-- ADD THIS
+      - REDIS_PASSWORD=        # <-- ADD THIS (empty for local)
+      - REDIS_DB=0
     depends_on:
       - backend1
       - backend2
       - backend3
+      - redis
     
   # -------------------
   # Backend Servers
@@ -62,6 +64,16 @@ services:
       dockerfile: Dockerfile.backend
     container_name: backend-3
     command: ["-port", "9003", "Server-3"]
+
+  # -------------------
+  # NEW: Redis Service
+  # -------------------
+  redis:
+    image: "redis:7-alpine"
+    container_name: redis
+    ports:
+      - "6379:6379" # Expose for local debugging if you want
+    command: redis-server --save 60 1 --loglevel warning
 
 # Define the persistent volume for the cert cache
 volumes:

@@ -6,7 +6,6 @@ import (
 	"net/http"          // NEW
 	"net/http/httputil" // NEW
 	"net/url"
-	"strings" // NEW
 	"sync"
 	"sync/atomic"
 	"time"
@@ -119,19 +118,6 @@ func NewBackendPool(
 
 			// Run the default director first
 			originalDirector(r)
-
-			// --- Now, add/modify our headers ---
-			// Get the real client IP
-			clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-
-			// Add/Append the X-Forwarded-For header
-			if prior, ok := r.Header["X-Forwarded-For"]; ok {
-				// If it already exists, append our client IP
-				r.Header.Set("X-Forwarded-For", strings.Join(prior, ", ")+", "+clientIP)
-			} else {
-				// Otherwise, create it
-				r.Header.Set("X-Forwarded-For", clientIP)
-			}
 
 			// Set the X-Forwarded-Host to the original host
 			r.Header.Set("X-Forwarded-Host", originalHost)
