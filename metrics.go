@@ -53,7 +53,11 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 					b.Addr, route.config.Path, route.config.Host)
 
 				body += fmt.Sprintf("backend_health_status{%s} %d\n", label, health)
+
+				// --- THIS IS THE FIX ---
 				conns := b.GetConnections()
+				// --- END OF FIX ---
+
 				body += fmt.Sprintf("backend_active_connections{%s} %d\n", label, conns)
 
 				if b.cb != nil {
@@ -69,8 +73,12 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 					}
 					body += fmt.Sprintf("backend_circuit_state{%s} %d\n", label, stateNum)
 				}
+
+				body += "\n" // Add a newline to separate each backend's metrics
 			}
 		}
+
+		body += "\n" // Add a newline to separate summary stats
 		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
 		if cache != nil {
 			body += fmt.Sprintf("cache_item_count %d\n", cache.ItemCount())

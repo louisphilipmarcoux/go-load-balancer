@@ -44,7 +44,7 @@ jobs:
       - name: Cache golangci-lint
         uses: actions/cache@v4
         with:
-          path: ~/go/bin/golangci-lint
+          path: $(go env GOPATH)/bin/golangci-lint
           # Re-cache only if go.mod changes
           key: ${{ runner.os }}-golangci-lint-${{ hashFiles('go.mod') }}
           restore-keys: |
@@ -53,6 +53,13 @@ jobs:
       - name: Run Linter
         run: |
           $(go env GOPATH)/bin/golangci-lint run ./...
+
+      - name: Generate Test Certs
+        run: |
+          echo "Generating self-signed certs for testing..."
+          openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
+            -days 365 -nodes -subj "/CN=localhost"
+          echo "Certs generated."
 
       - name: Run Tests
         run: go test -v -race ./...

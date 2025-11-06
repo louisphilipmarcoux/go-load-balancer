@@ -8,7 +8,7 @@ backend/backend
 # OS-specific
 .DS_Store
 
-# Private keys
+# Private keys - NEVER commit these
 *.key
 
 # Test certificates
