@@ -6,44 +6,38 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
+
+	// "net/http/httputil" // No longer needed here
+	// "net/url" // No longer needed here
 	"strings"
 	"sync"
 
 	"github.com/sony/gobreaker"
 )
 
-// Route holds the compiled logic for a single route
+// ... (Route struct - no changes) ...
 type Route struct {
 	config  *RouteConfig
 	pool    *BackendPool
 	handler http.Handler
 }
 
-// Matches checks if a request matches this route's rules
 func (rt *Route) Matches(r *http.Request) bool {
-	// 1. Match Host
 	if rt.config.Host != "" && rt.config.Host != r.Host {
 		return false
 	}
-
-	// 2. Match Path
 	if rt.config.Path != "" && !strings.HasPrefix(r.URL.Path, rt.config.Path) {
 		return false
 	}
-
-	// 3. Match Headers
 	for key, value := range rt.config.Headers {
 		if r.Header.Get(key) != value {
 			return false
 		}
 	}
-
 	return true
 }
 
-// LoadBalancer holds the state for the entire server
+// ... (LoadBalancer struct - no changes) ...
 type LoadBalancer struct {
 	cfg    *Config
 	routes []*Route
@@ -51,19 +45,24 @@ type LoadBalancer struct {
 	lock   sync.RWMutex
 }
 
-// NewLoadBalancer creates a new LoadBalancer
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
-	lb.ReloadConfig(cfg) // Use ReloadConfig to set initial state
+	lb.ReloadConfig(cfg)
 	return lb
 }
 
-// buildRoutes creates the http.Handler for each route
+// CHANGED: buildRoutes now passes connection pool config
 func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 	routes := make([]*Route, 0, len(cfg.Routes))
 
 	for _, routeCfg := range cfg.Routes {
-		pool := NewBackendPool(routeCfg.Strategy, routeCfg.Backends, cfg.CircuitBreaker)
+		// NEW: Pass connection pool and circuit breaker configs
+		pool := NewBackendPool(
+			routeCfg.Strategy,
+			routeCfg.Backends,
+			cfg.CircuitBreaker,
+			cfg.ConnectionPool, // Pass the new config
+		)
 		pool.StartHealthChecks()
 
 		// Create the reverse proxy handler for this pool
@@ -75,7 +74,7 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 				return
 			}
 
-			// Connection counting
+			// ... (Connection counting - no changes) ...
 			strategyNeedsConns := pool.strategy == "least-connections" ||
 				pool.strategy == "weighted-least-connections"
 			if strategyNeedsConns {
@@ -85,25 +84,26 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 				}()
 			}
 
-			targetUrl, err := url.Parse("http://" + backend.Addr)
-			if err != nil {
-				log.Printf("Failed to parse backend URL: %v", err)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
-				return
-			}
-			proxy := httputil.NewSingleHostReverseProxy(targetUrl)
+			// GONE: All proxy/URL creation logic is gone from here
 
-			// Circuit Breaker Logic
+			// --- Circuit Breaker Logic ---
 			if backend.cb != nil {
 				_, err := backend.cb.Execute(func() (interface{}, error) {
 					log.Printf("L7 Proxy: %s%s -> %s (CB: %s)", r.Host, r.URL.Path, backend.Addr, backend.cb.State())
 
 					recorder := &StatusRecorder{ResponseWriter: w, Status: http.StatusOK}
-					proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+
+					// NEW: Set the error handler *just before* the request
+					// This ensures the recorder is in scope
+					backend.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 						// This is a connection failure
+						// We can't write to 'w' here, as the recorder won't capture it.
+						// The error return will be handled by the circuit breaker logic.
+						log.Printf("Backend connection error for %s: %v", backend.Addr, err)
 					}
 
-					proxy.ServeHTTP(recorder, r)
+					// Use the pre-built proxy
+					backend.proxy.ServeHTTP(recorder, r)
 
 					if recorder.Status >= http.StatusInternalServerError {
 						return nil, fmt.Errorf("backend %s returned status %d", backend.Addr, recorder.Status)
@@ -116,13 +116,20 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 						log.Printf("Request blocked for %s (CB: %s)", backend.Addr, backend.cb.State())
 						http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
 					} else {
+						// Log the 5xx error or connection error
 						log.Printf("Failure recorded for %s: %v", backend.Addr, err)
+						// If the response wasn't already written (e.g., connection error),
+						// send a 502.
+						if w.Header().Get("Content-Type") == "" {
+							http.Error(w, "Bad Gateway", http.StatusBadGateway)
+						}
 					}
 				}
 			} else {
 				// No circuit breaker
 				log.Printf("L7 Proxy: %s%s -> %s", r.Host, r.URL.Path, backend.Addr)
-				proxy.ServeHTTP(w, r)
+				// Use the pre-built proxy
+				backend.proxy.ServeHTTP(w, r)
 			}
 		})
 
@@ -135,16 +142,13 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 	return routes
 }
 
-// getRoutes atomically gets the current routes
+// ... (getRoutes, ServeHTTP, ReloadConfig - no changes) ...
 func (lb *LoadBalancer) getRoutes() []*Route {
 	lb.lock.RLock()
 	defer lb.lock.RUnlock()
 	return lb.routes
 }
-
-// ServeHTTP is the main entry point for all requests
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// --- RATE LIMITING LOGIC ---
 	lb.lock.RLock()
 	limiterEnabled := lb.rl != nil
 	lb.lock.RUnlock()
@@ -163,9 +167,6 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// --- END RATE LIMITING LOGIC ---
-
-	// --- STAGE 19: ADVANCED ROUTING ---
 	currentRoutes := lb.getRoutes()
 	for _, route := range currentRoutes {
 		if route.Matches(r) {
@@ -173,13 +174,9 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// No route matched
 	log.Printf("No route found for: %s%s", r.Host, r.URL.Path)
 	http.NotFound(w, r)
 }
-
-// ReloadConfig atomically swaps the entire configuration
 func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 	newRoutes := lb.buildRoutes(cfg)
 	var newRl *RateLimiter

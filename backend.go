@@ -3,6 +3,9 @@ package main
 import (
 	"log"
 	"net"
+	"net/http"          // NEW
+	"net/http/httputil" // NEW
+	"net/url"           // NEW
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,38 +22,32 @@ type Backend struct {
 	CurrentWeight int
 	connections   uint64
 	cb            *gobreaker.CircuitBreaker
+	parsedURL     *url.URL               // NEW: Store the parsed URL
+	proxy         *httputil.ReverseProxy // NEW: Store the proxy
 }
 
-// IsHealthy checks if the backend is healthy
+// ... (IsHealthy, SetHealth, Inc/Dec/GetConnections - no changes) ...
 func (b *Backend) IsHealthy() bool {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
 	return b.healthy
 }
-
-// SetHealth updates the health status of the backend
 func (b *Backend) SetHealth(healthy bool) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 	b.healthy = healthy
 }
-
-// IncrementConnections increases the connection count
 func (b *Backend) IncrementConnections() {
 	atomic.AddUint64(&b.connections, 1)
 }
-
-// DecrementConnections decreases the connection count
 func (b *Backend) DecrementConnections() {
 	atomic.AddUint64(&b.connections, ^uint64(0))
 }
-
-// GetConnections returns the current connection count
 func (b *Backend) GetConnections() uint64 {
 	return atomic.LoadUint64(&b.connections)
 }
 
-// BackendPool holds a collection of backends for a single route
+// ... (BackendPool struct - no changes) ...
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -58,15 +55,36 @@ type BackendPool struct {
 	lock     sync.Mutex
 }
 
-// NewBackendPool creates a new backend pool
-func NewBackendPool(strategy string, backendConfigs []*BackendConfig, cbCfg *CircuitBreakerConfig) *BackendPool {
+// CHANGED: NewBackendPool now creates the shared transport and proxies
+func NewBackendPool(
+	strategy string,
+	backendConfigs []*BackendConfig,
+	cbCfg *CircuitBreakerConfig,
+	poolCfg *ConnectionPoolConfig, // NEW
+) *BackendPool {
+
+	// NEW: Create one shared transport for this entire pool
+	var transport *http.Transport
+	if poolCfg != nil {
+		transport = &http.Transport{
+			MaxIdleConns:        poolCfg.MaxIdleConns,
+			MaxIdleConnsPerHost: poolCfg.MaxIdleConnsPerHost,
+			IdleConnTimeout:     poolCfg.IdleConnTimeout,
+		}
+	} else {
+		// Use default transport if no config
+		transport = &http.Transport{}
+	}
+
 	backends := make([]*Backend, 0, len(backendConfigs))
 	for _, bc := range backendConfigs {
+		// ... (Weight logic - no change) ...
 		weight := 1
 		if bc.Weight > 0 {
 			weight = bc.Weight
 		}
 
+		// ... (Circuit breaker logic - no change) ...
 		var cb *gobreaker.CircuitBreaker
 		if cbCfg != nil && cbCfg.Enabled {
 			st := gobreaker.Settings{
@@ -82,10 +100,26 @@ func NewBackendPool(strategy string, backendConfigs []*BackendConfig, cbCfg *Cir
 			cb = gobreaker.NewCircuitBreaker(st)
 		}
 
+		// NEW: Parse URL and create the proxy ONCE
+		parsedURL, err := url.Parse("http://" + bc.Addr)
+		if err != nil {
+			log.Printf("Failed to parse backend URL %s: %v", bc.Addr, err)
+			continue // Skip this backend
+		}
+
+		// Create the proxy, but we'll customize it
+		proxy := httputil.NewSingleHostReverseProxy(parsedURL)
+		// Set the shared transport
+		proxy.Transport = transport
+		// We'll set the ErrorHandler in the handler logic to use the
+		// circuit breaker's status recorder.
+
 		backends = append(backends, &Backend{
-			Addr:   bc.Addr,
-			Weight: weight,
-			cb:     cb,
+			Addr:      bc.Addr,
+			Weight:    weight,
+			cb:        cb,
+			parsedURL: parsedURL, // Store it
+			proxy:     proxy,     // Store it
 		})
 	}
 	return &BackendPool{
@@ -94,7 +128,7 @@ func NewBackendPool(strategy string, backendConfigs []*BackendConfig, cbCfg *Cir
 	}
 }
 
-// healthCheck performs a single health check on a backend
+// ... (healthCheck, StartHealthChecks, GetTotalConnections - no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -114,8 +148,6 @@ func (p *BackendPool) healthCheck(b *Backend) {
 		b.SetHealth(true)
 	}
 }
-
-// StartHealthChecks starts the health check ticker
 func (p *BackendPool) StartHealthChecks() {
 	log.Printf("Starting health checks for %d backends...", len(p.backends))
 	for _, b := range p.backends {
@@ -136,8 +168,6 @@ func (p *BackendPool) StartHealthChecks() {
 		}
 	}()
 }
-
-// GetTotalConnections returns the sum of all backend connections
 func (p *BackendPool) GetTotalConnections() uint64 {
 	var total uint64
 	for _, b := range p.backends {
