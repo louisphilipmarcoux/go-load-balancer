@@ -8,8 +8,9 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http" // NEW: Import net/http
 	"os"
-	"os/signal"
+	"os/signal" // NEW: Import strconv
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,12 +19,15 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ... (No changes to Config, Backend, BackendPool, or any strategy functions) ...
+// --- Config Structs ---
 type Config struct {
-	ListenAddr string           `yaml:"listenAddr"`
-	Strategy   string           `yaml:"strategy"`
-	Backends   []*BackendConfig `yaml:"backends"`
+	ListenAddr  string           `yaml:"listenAddr"`
+	Strategy    string           `yaml:"strategy"`
+	MetricsAddr string           `yaml:"metricsAddr"` // NEW
+	Backends    []*BackendConfig `yaml:"backends"`
 }
+
+// ... (BackendConfig, LoadConfig - no changes) ...
 type BackendConfig struct {
 	Addr   string `yaml:"addr"`
 	Weight int    `yaml:"weight"`
@@ -47,6 +51,8 @@ func LoadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// --- Backend Structs ---
+// ... (Backend struct and methods - no changes) ...
 type Backend struct {
 	Addr          string
 	healthy       bool
@@ -76,6 +82,8 @@ func (b *Backend) GetConnections() uint64 {
 	return atomic.LoadUint64(&b.connections)
 }
 
+// --- BackendPool ---
+// ... (BackendPool struct, NewBackendPool, healthCheck, StartHealthChecks - no changes) ...
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -135,6 +143,18 @@ func (p *BackendPool) StartHealthChecks() {
 		}
 	}()
 }
+
+// NEW: GetTotalConnections calculates the sum of all backend connections
+func (p *BackendPool) GetTotalConnections() uint64 {
+	var total uint64
+	for _, b := range p.backends {
+		total += b.GetConnections()
+	}
+	return total
+}
+
+// --- Strategy Implementations ---
+// ... (All strategy functions - no changes) ...
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -217,6 +237,9 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	}
 	return bestBackend
 }
+
+// --- Proxy and LB ---
+// ... (handleProxy - no changes) ...
 func handleProxy(client, backend net.Conn) {
 	defer func() {
 		if err := client.Close(); err != nil {
@@ -247,9 +270,9 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
+// ... (RunLoadBalancer - no changes) ...
 func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *sync.WaitGroup) error {
 	log.Printf("Load Balancer listening on %s, strategy: %s", listener.Addr().String(), cfg.Strategy)
-
 	for {
 		client, err := listener.Accept()
 		if err != nil {
@@ -260,16 +283,12 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *
 			log.Printf("Failed to accept connection: %v", err)
 			continue
 		}
-
 		wg.Add(1)
-
 		go func(c net.Conn) {
 			defer wg.Done()
-
 			var backend *Backend
 			strategyNeedsConns := pool.strategy == "least-connections" ||
 				pool.strategy == "weighted-least-connections"
-
 			switch pool.strategy {
 			case "ip-hash":
 				clientIP, _, err := net.SplitHostPort(c.RemoteAddr().String())
@@ -292,7 +311,6 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *
 			default:
 				backend = pool.GetNextBackendByRoundRobin()
 			}
-
 			if backend == nil {
 				log.Println("No available backends")
 				if err := c.Close(); err != nil {
@@ -300,17 +318,11 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *
 				}
 				return
 			}
-
 			if strategyNeedsConns {
 				backend.IncrementConnections()
 				defer backend.DecrementConnections()
 			}
-
-			// --- THIS IS THE FIX ---
-			// Use DialTimeout to prevent goroutines from hanging
 			backendConn, err := net.DialTimeout("tcp", backend.Addr, 3*time.Second)
-			// --- END OF FIX ---
-
 			if err != nil {
 				log.Printf("Failed to connect to backend: %s", backend.Addr)
 				if err := c.Close(); err != nil {
@@ -321,13 +333,50 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *
 				}
 				return
 			}
-
 			handleProxy(c, backendConn)
 		}(client)
 	}
 }
 
-// ... main function (no changes) ...
+// NEW: StartMetricsServer starts a separate server for /metrics
+func StartMetricsServer(addr string, pool *BackendPool) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		// Format and write metrics
+		var body string
+
+		// 1. Total active connections
+		totalConns := pool.GetTotalConnections()
+		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
+
+		// 2. Per-backend stats
+		// THE FIX: Change 'i, b' to '_, b'
+		for _, b := range pool.backends {
+			// Health status (1 for up, 0 for down)
+			health := 0
+			if b.IsHealthy() {
+				health = 1
+			}
+			body += fmt.Sprintf("backend_health_status{backend=\"%s\"} %d\n", b.Addr, health)
+
+			// Active connections per backend
+			conns := b.GetConnections()
+			body += fmt.Sprintf("backend_active_connections{backend=\"%s\"} %d\n", b.Addr, conns)
+		}
+
+		w.Header().Set("Content-Type", "text/plain")
+		if _, err := w.Write([]byte(body)); err != nil {
+			log.Printf("Warning: failed to write metrics response: %v", err)
+		}
+	})
+
+	log.Printf("Metrics server listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("Metrics server failed: %v", err)
+	}
+}
+
+// CHANGED: main now starts the metrics server in a goroutine
 func main() {
 	cfg, err := LoadConfig("config.yaml")
 	if err != nil {
@@ -335,6 +384,12 @@ func main() {
 	}
 	pool := NewBackendPool(cfg)
 	pool.StartHealthChecks()
+
+	// NEW: Start the metrics server
+	if cfg.MetricsAddr != "" {
+		go StartMetricsServer(cfg.MetricsAddr, pool)
+	}
+
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		log.Fatalf("Failed to create listener: %v", err)
