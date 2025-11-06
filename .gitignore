@@ -7,3 +7,12 @@ backend/backend
 
 # OS-specific
 .DS_Store
+
+# Private keys
+*.key
+
+# Test certificates
+*.crt
+
+# Let's Encrypt certificate cache
+certs/
