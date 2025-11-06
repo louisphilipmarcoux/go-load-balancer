@@ -5,7 +5,8 @@ import (
 	"net"
 	"net/http"          // NEW
 	"net/http/httputil" // NEW
-	"net/url"           // NEW
+	"net/url"
+	"strings" // NEW
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,6 +104,40 @@ func NewBackendPool(
 
 		proxy := httputil.NewSingleHostReverseProxy(parsedURL)
 		proxy.Transport = transport
+
+		// Save the default director created by NewSingleHostReverseProxy
+		originalDirector := proxy.Director
+
+		// Create a new director that wraps the original
+		proxy.Director = func(r *http.Request) {
+			// Get the original request's host and protocol
+			originalHost := r.Host
+			originalProto := "http"
+			if r.TLS != nil {
+				originalProto = "https"
+			}
+
+			// Run the default director first
+			originalDirector(r)
+
+			// --- Now, add/modify our headers ---
+			// Get the real client IP
+			clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+			// Add/Append the X-Forwarded-For header
+			if prior, ok := r.Header["X-Forwarded-For"]; ok {
+				// If it already exists, append our client IP
+				r.Header.Set("X-Forwarded-For", strings.Join(prior, ", ")+", "+clientIP)
+			} else {
+				// Otherwise, create it
+				r.Header.Set("X-Forwarded-For", clientIP)
+			}
+
+			// Set the X-Forwarded-Host to the original host
+			r.Header.Set("X-Forwarded-Host", originalHost)
+			// Set the X-Forwarded-Proto
+			r.Header.Set("X-Forwarded-Proto", originalProto)
+		}
 
 		backends = append(backends, &Backend{
 			Addr:      bc.Addr,

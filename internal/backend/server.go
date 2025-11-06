@@ -12,29 +12,37 @@ import (
 func RunServer(port, serverID string) (net.Listener, error) {
 	log.Printf("Starting backend server %s on port %s\n", serverID, port)
 
-	// NEW: Define the handler logic
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[Server %s] Received request from %s", serverID, r.RemoteAddr)
+		// --- NEW LOGGING ---
+		// Read the headers set by the load balancer
+		realIP := r.Header.Get("X-Forwarded-For")
+		host := r.Header.Get("X-Forwarded-Host")
+		proto := r.Header.Get("X-Forwarded-Proto")
+
+		// Log all the new information
+		log.Printf(
+			"[Server %s] Received request. LB-IP: %s, Client-IP: %s, Host: %s, Proto: %s",
+			serverID,
+			r.RemoteAddr, // This is the LB's container IP
+			realIP,       // This is the original client's IP
+			host,
+			proto,
+		)
+		// --- END NEW LOGGING ---
+
 		// Check the error return value.
 		if _, err := fmt.Fprintf(w, "Hello from backend server: %s\n", serverID); err != nil {
 			log.Printf("Warning: failed to write response: %v", err)
 		}
 	})
 
-	// GONE: http.HandleFunc("/", ...) - We no longer use the global mux
-
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		return nil, err
 	}
 
-	// Start serving in a goroutine so this function can return
 	go func() {
-		// CHANGED: Pass our specific handler, not 'nil' (which uses the global mux)
 		err := http.Serve(listener, handler)
-
-		// We expect a net.ErrClosed when the listener is closed,
-		// We check for it and exit gracefully instead of calling log.Fatalf.
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Fatalf("Failed to start server: %v", err)
 		}
