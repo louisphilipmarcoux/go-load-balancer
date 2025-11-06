@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -9,15 +10,24 @@ import (
 	"github.com/sony/gobreaker"
 )
 
-// StatusRecorder captures the HTTP status code
-type StatusRecorder struct {
+// CachingRecorder captures Status, Headers, and Body
+type CachingRecorder struct {
 	http.ResponseWriter
-	Status int
+	Status      int
+	Body        *bytes.Buffer
+	wroteHeader bool // Did we write the header yet?
 }
 
-func (r *StatusRecorder) WriteHeader(status int) {
+func (r *CachingRecorder) WriteHeader(status int) {
 	r.Status = status
-	r.ResponseWriter.WriteHeader(status)
+	r.wroteHeader = true
+	// Don't write to underlying writer yet!
+	// We'll do that at the very end.
+}
+
+func (r *CachingRecorder) Write(b []byte) (int, error) {
+	// Write to our buffer
+	return r.Body.Write(b)
 }
 
 // StartMetricsServer starts the /metrics endpoint
@@ -26,6 +36,7 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		lb.lock.RLock()
 		routes := lb.routes
+		cache := lb.cache
 		lb.lock.RUnlock()
 
 		var body string
@@ -38,7 +49,6 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 				if b.IsHealthy() {
 					health = 1
 				}
-				// Use path and host as labels
 				label := fmt.Sprintf("backend=\"%s\", route_path=\"%s\", route_host=\"%s\"",
 					b.Addr, route.config.Path, route.config.Host)
 
@@ -62,6 +72,9 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 			}
 		}
 		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
+		if cache != nil {
+			body += fmt.Sprintf("cache_item_count %d\n", cache.ItemCount())
+		}
 
 		w.Header().Set("Content-Type", "text/plain")
 		if _, err := w.Write([]byte(body)); err != nil {

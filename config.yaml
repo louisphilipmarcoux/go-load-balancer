@@ -24,6 +24,11 @@ connectionPool:
   # How long an idle connection is kept open
   idleConnTimeout: "90s"
 
+cache:
+  enabled: true
+  defaultExpiration: "5m" # How long to cache an item
+  cleanupInterval: "10m" # How often to scan for expired items
+
 routes:
   # ---
   # ALL YOUR OTHER ROUTES GO HERE FIRST
