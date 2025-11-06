@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context" // NEW
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -11,8 +11,8 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/http/httputil" // NEW
-	"net/url"           // NEW
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"sync"
@@ -24,14 +24,21 @@ import (
 )
 
 // --- Config Structs ---
-// CHANGED: Config now holds routes
+// CHANGED: Added TLS
 type Config struct {
 	ListenAddr  string         `yaml:"listenAddr"`
 	MetricsAddr string         `yaml:"metricsAddr"`
+	TLS         *TLSConfig     `yaml:"tls"` // NEW
 	Routes      []*RouteConfig `yaml:"routes"`
 }
 
-// NEW: RouteConfig defines a path and its associated pool
+// NEW: TLSConfig struct
+type TLSConfig struct {
+	CertFile string `yaml:"certFile"`
+	KeyFile  string `yaml:"keyFile"`
+}
+
+// ... (RouteConfig, BackendConfig, LoadConfig - no changes) ...
 type RouteConfig struct {
 	Path     string           `yaml:"path"`
 	Strategy string           `yaml:"strategy"`
@@ -44,7 +51,6 @@ type BackendConfig struct {
 }
 
 func LoadConfig(path string) (*Config, error) {
-	// ... (No changes to this function) ...
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open config file: %w", err)
@@ -94,6 +100,7 @@ func (b *Backend) GetConnections() uint64 {
 }
 
 // --- BackendPool ---
+// ... (NewBackendPool, healthCheck, StartHealthChecks, GetTotalConnections - no changes) ...
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -101,7 +108,6 @@ type BackendPool struct {
 	lock     sync.Mutex
 }
 
-// CHANGED: NewBackendPool now takes strategy and backend configs directly
 func NewBackendPool(strategy string, backendConfigs []*BackendConfig) *BackendPool {
 	backends := make([]*Backend, 0, len(backendConfigs))
 	for _, bc := range backendConfigs {
@@ -119,8 +125,6 @@ func NewBackendPool(strategy string, backendConfigs []*BackendConfig) *BackendPo
 		strategy: strategy,
 	}
 }
-
-// ... (healthCheck, StartHealthChecks, GetTotalConnections - no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -165,8 +169,7 @@ func (p *BackendPool) GetTotalConnections() uint64 {
 }
 
 // --- Strategy Implementations ---
-
-// NEW: GetNextBackend wraps all strategies and accepts *http.Request
+// ... (GetNextBackend, GetNextBackendByIP, ...etc - no changes) ...
 func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
 	switch p.strategy {
 	case "ip-hash":
@@ -188,8 +191,6 @@ func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
 		return p.GetNextBackendByRoundRobin()
 	}
 }
-
-// ... (GetNextBackendByIP, LeastConns, RoundRobin, etc. - no changes) ...
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -274,9 +275,7 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 }
 
 // --- Proxy and LB ---
-// GONE: handleProxy (TCP copy) is no longer needed
-
-// CHANGED: LoadBalancer now holds the router and pools
+// ... (LoadBalancer struct, buildState, NewLoadBalancer, ServeHTTP, ReloadConfig - no changes) ...
 type LoadBalancer struct {
 	cfg   *Config
 	mux   *http.ServeMux
@@ -284,7 +283,6 @@ type LoadBalancer struct {
 	lock  sync.RWMutex
 }
 
-// NEW: buildState creates the router and pools from config
 func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*BackendPool) {
 	mux := http.NewServeMux()
 	pools := make(map[string]*BackendPool)
@@ -336,15 +334,12 @@ func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*Bac
 	return mux, pools
 }
 
-// CHANGED: NewLoadBalancer uses buildState
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{cfg: cfg}
 	lb.mux, lb.pools = lb.buildState(cfg)
 	return lb
 }
 
-// NEW: ServeHTTP makes LoadBalancer an http.Handler
-// It safely gets the current mux and serves the request
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.lock.RLock()
 	mux := lb.mux
@@ -352,7 +347,6 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mux.ServeHTTP(w, r)
 }
 
-// CHANGED: ReloadConfig now rebuilds the mux and pools
 func (lb *LoadBalancer) ReloadConfig(path string) error {
 	log.Println("Reloading configuration from", path)
 	cfg, err := LoadConfig(path)
@@ -372,9 +366,7 @@ func (lb *LoadBalancer) ReloadConfig(path string) error {
 	return nil
 }
 
-// GONE: RunLoadBalancer (TCP accept loop) is no longer needed
-
-// CHANGED: StartMetricsServer now reads from multiple pools
+// ... (StartMetricsServer - no changes) ...
 func StartMetricsServer(addr string, lb *LoadBalancer) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -413,7 +405,7 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 	}
 }
 
-// CHANGED: main now uses http.Server and Shutdown()
+// CHANGED: main now checks for TLS config
 func main() {
 	configPath := "config.yaml"
 	cfg, err := LoadConfig(configPath)
@@ -437,9 +429,19 @@ func main() {
 
 	// Start the main load balancer server in a goroutine
 	go func() {
-		log.Printf("Load Balancer (L7) listening on %s", server.Addr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("Failed to run load balancer: %v", err)
+		// --- THIS IS THE KEY CHANGE ---
+		if cfg.TLS != nil {
+			// Start an HTTPS server
+			log.Printf("Load Balancer (L7/TLS) listening on %s", server.Addr)
+			if err := server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("Failed to run TLS load balancer: %v", err)
+			}
+		} else {
+			// Start a plain HTTP server
+			log.Printf("Load Balancer (L7/HTTP) listening on %s", server.Addr)
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("Failed to run HTTP load balancer: %v", err)
+			}
 		}
 	}()
 
@@ -452,12 +454,9 @@ func main() {
 		case syscall.SIGINT, syscall.SIGTERM:
 			// --- Graceful Shutdown ---
 			log.Println("Shutting down... Stopping new connections.")
-
-			// Create a context for shutdown
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			// Shutdown the server
 			if err := server.Shutdown(ctx); err != nil {
 				log.Printf("Graceful shutdown failed: %v", err)
 			} else {

@@ -1,16 +1,21 @@
-listenAddr: ":8080"
+listenAddr: ":8443" # <-- CHANGED to a common HTTPS test port
 metricsAddr: ":9090"
+
+# NEW: Add a TLS block
+tls:
+  certFile: "server.crt"
+  keyFile: "server.key"
 
 routes:
   # Route for API servers
-  - path: "/api/" # Note the trailing slash for prefix matching
+  - path: "/api/"
     strategy: "round-robin"
     backends:
       - addr: "localhost:9001"
         weight: 1
 
   # Default/Web route
-  - path: "/" # This will catch everything else
+  - path: "/"
     strategy: "weighted-least-connections"
     backends:
       - addr: "localhost:9002"
