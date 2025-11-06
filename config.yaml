@@ -1,8 +1,10 @@
 listenAddr: ":8080"
 strategy: "weighted-least-connections"
+# NEW: Add an address for the metrics server
+metricsAddr: ":9090"
 backends:
   - addr: "localhost:9001"
-    weight: 5 # This server gets 5x the traffic
+    weight: 5
   - addr: "localhost:9002"
     weight: 1
   - addr: "localhost:9003"

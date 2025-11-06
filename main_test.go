@@ -15,23 +15,23 @@ import (
 )
 
 // --- CHANGED THIS BLOCK ---
-// We'll use a high, non-standard port for our test
-// to avoid colliding with manually-run servers.
+// Add a const for the test metrics server
 const (
-	lbAddr      = "localhost:8080" // This is fine, LB is the entry point
-	backendAddr = "localhost:9099" // CHANGED from 9001
+	lbAddr      = "localhost:8080"
+	backendAddr = "localhost:9099"
+	metricsAddr = "localhost:9090" // NEW
 	backendID   = "Test-Server-1"
 )
 
 // --- END OF CHANGE ---
 
+// ... waitForPort (no changes) ...
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("port %s never became available", addr)
 		}
-
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil && conn != nil {
 			if err := conn.Close(); err != nil {
@@ -39,13 +39,12 @@ func waitForPort(addr string, timeout time.Duration) error {
 			}
 			return nil
 		}
-
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
+// CHANGED: Update TestMain to start metrics server
 func TestMain(m *testing.M) {
-	// CHANGED: Use the port from our new const
 	backendListener, err := backend.RunServer("9099", backendID)
 	if err != nil {
 		log.Fatalf("Failed to start backend server: %v", err)
@@ -57,12 +56,18 @@ func TestMain(m *testing.M) {
 	}()
 
 	cfg := &Config{
-		ListenAddr: lbAddr,
-		Strategy:   "round-robin",
-		Backends:   []*BackendConfig{{Addr: backendAddr, Weight: 1}}, // backendAddr is now 9099
+		ListenAddr:  lbAddr,
+		MetricsAddr: metricsAddr, // NEW
+		Strategy:    "round-robin",
+		Backends:    []*BackendConfig{{Addr: backendAddr, Weight: 1}},
 	}
 	testPool := NewBackendPool(cfg)
 	testPool.backends[0].SetHealth(true)
+
+	// NEW: Start the metrics server for testing
+	// Note: We don't have a graceful shutdown for this in the test,
+	// but that's okay for now.
+	go StartMetricsServer(cfg.MetricsAddr, testPool)
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -73,26 +78,29 @@ func TestMain(m *testing.M) {
 			log.Printf("Warning: failed to close test listener: %v", err)
 		}
 	}()
-
 	var wg sync.WaitGroup
-
 	go func() {
 		if err := RunLoadBalancer(cfg, testPool, listener, &wg); err != nil {
 			log.Printf("LB exited: %v", err)
 		}
 	}()
 
+	// Wait for all servers
 	if err := waitForPort(backendAddr, 2*time.Second); err != nil {
 		log.Fatalf("Backend server failed to start: %v", err)
 	}
 	if err := waitForPort(lbAddr, 2*time.Second); err != nil {
 		log.Fatalf("Load balancer failed to start: %v", err)
 	}
+	// NEW: Wait for metrics server
+	if err := waitForPort(metricsAddr, 2*time.Second); err != nil {
+		log.Fatalf("Metrics server failed to start: %v", err)
+	}
 
 	m.Run()
 }
 
-// ... (All other test functions remain 100% the same) ...
+// ... (All other tests remain the same) ...
 func TestProxyRequest(t *testing.T) {
 	resp, err := http.Get("http://" + lbAddr)
 	if err != nil {
@@ -265,5 +273,41 @@ func TestGetNextBackendByWeightedLeastConns(t *testing.T) {
 	if be.Addr != "server3" {
 		t.Errorf("Expected server3 (score 1.0), got %s (score %f)",
 			be.Addr, float64(be.GetConnections())/float64(be.Weight))
+	}
+}
+
+// NEW: Test for the metrics server
+func TestMetricsServer(t *testing.T) {
+	// 1. Make a request to the metrics server
+	resp, err := http.Get("http://" + metricsAddr + "/metrics")
+	if err != nil {
+		t.Fatalf("Failed to make request to metrics server: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Logf("Warning: failed to close metrics response body: %v", err)
+		}
+	}()
+
+	// 2. Read the response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read metrics response body: %v", err)
+	}
+
+	// 3. Verify the response
+	// We're testing against the *test* server (Test-Server-1 on port 9099)
+	// which we set to healthy=true in TestMain.
+	expectedMetrics := []string{
+		"total_active_connections 0",
+		fmt.Sprintf("backend_health_status{backend=\"%s\"} 1", backendAddr),
+		fmt.Sprintf("backend_active_connections{backend=\"%s\"} 0", backendAddr),
+	}
+
+	for _, expected := range expectedMetrics {
+		if !strings.Contains(string(body), expected) {
+			t.Errorf("Metrics response missing expected line. Got:\n%s\nExpected to contain:\n%s",
+				string(body), expected)
+		}
 	}
 }
