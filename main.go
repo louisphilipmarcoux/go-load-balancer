@@ -8,9 +8,9 @@ import (
 	"log"
 	"math"
 	"net"
-	"net/http" // NEW: Import net/http
+	"net/http"
 	"os"
-	"os/signal" // NEW: Import strconv
+	"os/signal"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,14 +20,13 @@ import (
 )
 
 // --- Config Structs ---
+// ... (No changes) ...
 type Config struct {
 	ListenAddr  string           `yaml:"listenAddr"`
 	Strategy    string           `yaml:"strategy"`
-	MetricsAddr string           `yaml:"metricsAddr"` // NEW
+	MetricsAddr string           `yaml:"metricsAddr"`
 	Backends    []*BackendConfig `yaml:"backends"`
 }
-
-// ... (BackendConfig, LoadConfig - no changes) ...
 type BackendConfig struct {
 	Addr   string `yaml:"addr"`
 	Weight int    `yaml:"weight"`
@@ -52,7 +51,7 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // --- Backend Structs ---
-// ... (Backend struct and methods - no changes) ...
+// ... (No changes) ...
 type Backend struct {
 	Addr          string
 	healthy       bool
@@ -83,7 +82,7 @@ func (b *Backend) GetConnections() uint64 {
 }
 
 // --- BackendPool ---
-// ... (BackendPool struct, NewBackendPool, healthCheck, StartHealthChecks - no changes) ...
+// ... (No changes) ...
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -143,8 +142,6 @@ func (p *BackendPool) StartHealthChecks() {
 		}
 	}()
 }
-
-// NEW: GetTotalConnections calculates the sum of all backend connections
 func (p *BackendPool) GetTotalConnections() uint64 {
 	var total uint64
 	for _, b := range p.backends {
@@ -154,7 +151,7 @@ func (p *BackendPool) GetTotalConnections() uint64 {
 }
 
 // --- Strategy Implementations ---
-// ... (All strategy functions - no changes) ...
+// ... (No changes) ...
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -238,7 +235,7 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	return bestBackend
 }
 
-// --- Proxy and LB ---
+// --- Proxy ---
 // ... (handleProxy - no changes) ...
 func handleProxy(client, backend net.Conn) {
 	defer func() {
@@ -270,11 +267,58 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// ... (RunLoadBalancer - no changes) ...
-func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *sync.WaitGroup) error {
-	log.Printf("Load Balancer listening on %s, strategy: %s", listener.Addr().String(), cfg.Strategy)
+// --- NEW: LoadBalancer Struct ---
+// LoadBalancer holds the state that needs to be hot-swappable
+type LoadBalancer struct {
+	cfg      *Config
+	pool     *BackendPool
+	lock     sync.RWMutex
+	listener net.Listener
+	wg       sync.WaitGroup
+}
+
+// NewLoadBalancer creates a new LoadBalancer instance
+func NewLoadBalancer(cfg *Config, listener net.Listener) *LoadBalancer {
+	pool := NewBackendPool(cfg)
+	return &LoadBalancer{
+		cfg:      cfg,
+		pool:     pool,
+		listener: listener,
+	}
+}
+
+// GetPool atomically retrieves the current backend pool
+func (lb *LoadBalancer) GetPool() *BackendPool {
+	lb.lock.RLock()
+	defer lb.lock.RUnlock()
+	return lb.pool
+}
+
+// ReloadConfig loads a new config file and atomically swaps the backend pool
+func (lb *LoadBalancer) ReloadConfig(path string) error {
+	log.Println("Reloading configuration from", path)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		return fmt.Errorf("failed to load new config: %w", err)
+	}
+
+	newPool := NewBackendPool(cfg)
+	newPool.StartHealthChecks() // Start health checks for the new pool
+
+	lb.lock.Lock()
+	lb.cfg = cfg
+	lb.pool = newPool
+	lb.lock.Unlock()
+
+	log.Println("Configuration successfully reloaded.")
+	return nil
+}
+
+// --- CHANGED: RunLoadBalancer is now a method on LoadBalancer ---
+func (lb *LoadBalancer) Run() error {
+	log.Printf("Load Balancer listening on %s, strategy: %s", lb.listener.Addr().String(), lb.cfg.Strategy)
 	for {
-		client, err := listener.Accept()
+		client, err := lb.listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				log.Println("Listener closed. No longer accepting new connections.")
@@ -283,9 +327,14 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *
 			log.Printf("Failed to accept connection: %v", err)
 			continue
 		}
-		wg.Add(1)
+
+		lb.wg.Add(1)
 		go func(c net.Conn) {
-			defer wg.Done()
+			defer lb.wg.Done()
+
+			// Get the *current* pool for this connection
+			pool := lb.GetPool()
+
 			var backend *Backend
 			strategyNeedsConns := pool.strategy == "least-connections" ||
 				pool.strategy == "weighted-least-connections"
@@ -338,11 +387,12 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *
 	}
 }
 
-// NEW: StartMetricsServer starts a separate server for /metrics
-func StartMetricsServer(addr string, pool *BackendPool) {
+// --- CHANGED: StartMetricsServer now accepts *LoadBalancer ---
+func StartMetricsServer(addr string, lb *LoadBalancer) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		// Format and write metrics
+		// Get the *current* pool for this metrics scrape
+		pool := lb.GetPool()
 		var body string
 
 		// 1. Total active connections
@@ -350,16 +400,12 @@ func StartMetricsServer(addr string, pool *BackendPool) {
 		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
 
 		// 2. Per-backend stats
-		// THE FIX: Change 'i, b' to '_, b'
 		for _, b := range pool.backends {
-			// Health status (1 for up, 0 for down)
 			health := 0
 			if b.IsHealthy() {
 				health = 1
 			}
 			body += fmt.Sprintf("backend_health_status{backend=\"%s\"} %d\n", b.Addr, health)
-
-			// Active connections per backend
 			conns := b.GetConnections()
 			body += fmt.Sprintf("backend_active_connections{backend=\"%s\"} %d\n", b.Addr, conns)
 		}
@@ -376,47 +422,67 @@ func StartMetricsServer(addr string, pool *BackendPool) {
 	}
 }
 
-// CHANGED: main now starts the metrics server in a goroutine
+// --- CHANGED: main now uses LoadBalancer and handles SIGHUP ---
 func main() {
-	cfg, err := LoadConfig("config.yaml")
+	configPath := "config.yaml"
+	cfg, err := LoadConfig(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
-	}
-	pool := NewBackendPool(cfg)
-	pool.StartHealthChecks()
-
-	// NEW: Start the metrics server
-	if cfg.MetricsAddr != "" {
-		go StartMetricsServer(cfg.MetricsAddr, pool)
 	}
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		log.Fatalf("Failed to create listener: %v", err)
 	}
-	var wg sync.WaitGroup
+
+	// Create the central LoadBalancer
+	lb := NewLoadBalancer(cfg, listener)
+	lb.pool.StartHealthChecks() // Start initial health checks
+
+	// Start the metrics server
+	if cfg.MetricsAddr != "" {
+		go StartMetricsServer(cfg.MetricsAddr, lb)
+	}
+
+	// Start the main load balancer run loop
 	go func() {
-		if err := RunLoadBalancer(cfg, pool, listener, &wg); err != nil {
+		if err := lb.Run(); err != nil {
 			log.Printf("Failed to run load balancer: %v", err)
 		}
 	}()
+
+	// --- Signal handling for shutdown AND reload ---
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-	log.Println("Shutting down... Stopping new connections.")
-	if err := listener.Close(); err != nil {
-		log.Printf("Warning: failed to close listener: %v", err)
-	}
-	log.Println("Waiting for all active connections to finish...")
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		log.Println("Graceful shutdown complete.")
-	case <-time.After(30 * time.Second):
-		log.Println("Shutdown timeout. Forcing exit.")
+	// Listen for INT, TERM (shutdown) and HUP (reload)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	for sig := range sigChan {
+		switch sig {
+		case syscall.SIGINT, syscall.SIGTERM:
+			// --- Graceful Shutdown ---
+			log.Println("Shutting down... Stopping new connections.")
+			if err := lb.listener.Close(); err != nil {
+				log.Printf("Warning: failed to close listener: %v", err)
+			}
+			log.Println("Waiting for all active connections to finish...")
+			done := make(chan struct{})
+			go func() {
+				lb.wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+				log.Println("Graceful shutdown complete.")
+			case <-time.After(30 * time.Second):
+				log.Println("Shutdown timeout. Forcing exit.")
+			}
+			return // Exit main
+
+		case syscall.SIGHUP:
+			// --- Hot Reload ---
+			if err := lb.ReloadConfig(configPath); err != nil {
+				log.Printf("Failed to reload config: %v", err)
+			}
+		}
 	}
 }
