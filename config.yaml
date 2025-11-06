@@ -15,24 +15,36 @@ circuitBreaker:
   consecutiveFailures: 5
   openStateTimeout: "15s"
 
+# NEW: Add connection pool settings
+connectionPool:
+  # Max total idle connections (all hosts)
+  maxIdleConns: 100
+  # Max idle connections *per backend host*
+  maxIdleConnsPerHost: 10
+  # How long an idle connection is kept open
+  idleConnTimeout: "90s"
+
 routes:
-  # NEW: Route for a specific host
+  # ---
+  # ALL YOUR OTHER ROUTES GO HERE FIRST
+  # ---
   - host: "api.example.com"
     path: "/"
     strategy: "round-robin"
     backends:
-      - addr: "localhost:9001" # API server
+      - addr: "localhost:9001"
 
-  # NEW: Route for a specific header (e.g., mobile users)
   - path: "/"
     headers:
       "User-Agent": "MobileApp"
     strategy: "round-robin"
     backends:
-      - addr: "localhost:9002" # Mobile-specific server
+      - addr: "localhost:9002"
 
-  # Default route for everyone else
-  - path: "/"
+  # ---
+  # THIS MUST BE THE LAST ROUTE
+  # ---
+  - path: "/" # This catches everything else
     strategy: "weighted-least-connections"
     backends:
-      - addr: "localhost:9003" # Main web server
+      - addr: "localhost:9003"
