@@ -14,6 +14,7 @@ import (
 	"github.com/louisphilipmarcoux/go-load-balancer/backend"
 )
 
+// ... consts, waitForPort, TestMain, TestProxyRequest, TestHandleProxy_Unit, TestBackendHealth (no changes) ...
 const (
 	lbAddr      = "localhost:8080"
 	backendAddr = "localhost:9001"
@@ -26,7 +27,6 @@ func waitForPort(addr string, timeout time.Duration) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("port %s never became available", addr)
 		}
-
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil && conn != nil {
 			if err := conn.Close(); err != nil {
@@ -34,11 +34,9 @@ func waitForPort(addr string, timeout time.Duration) error {
 			}
 			return nil
 		}
-
 		time.Sleep(100 * time.Millisecond)
 	}
 }
-
 func TestMain(m *testing.M) {
 	backendListener, err := backend.RunServer("9001", backendID)
 	if err != nil {
@@ -49,7 +47,6 @@ func TestMain(m *testing.M) {
 			log.Printf("Warning: failed to close backend listener: %v", err)
 		}
 	}()
-
 	cfg := &Config{
 		ListenAddr: ":8080",
 		Strategy:   "round-robin",
@@ -57,23 +54,19 @@ func TestMain(m *testing.M) {
 	}
 	testPool := NewBackendPool(cfg)
 	testPool.backends[0].SetHealth(true)
-
 	go func() {
 		if err := RunLoadBalancer(cfg, testPool); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("LB exited: %v", err)
 		}
 	}()
-
 	if err := waitForPort(backendAddr, 2*time.Second); err != nil {
 		log.Fatalf("Backend server failed to start: %v", err)
 	}
 	if err := waitForPort(lbAddr, 2*time.Second); err != nil {
 		log.Fatalf("Load balancer failed to start: %v", err)
 	}
-
 	m.Run()
 }
-
 func TestProxyRequest(t *testing.T) {
 	resp, err := http.Get("http://" + lbAddr)
 	if err != nil {
@@ -93,7 +86,6 @@ func TestProxyRequest(t *testing.T) {
 		t.Errorf("Unexpected response body. Got %q, expected to contain %q", string(body), expectedResponse)
 	}
 }
-
 func TestHandleProxy_Unit(t *testing.T) {
 	clientConn, clientPipe := net.Pipe()
 	backendConn, backendPipe := net.Pipe()
@@ -130,7 +122,6 @@ func TestHandleProxy_Unit(t *testing.T) {
 		t.Logf("Warning: failed to close client pipe: %v", err)
 	}
 }
-
 func TestBackendHealth(t *testing.T) {
 	b := &Backend{}
 	if b.IsHealthy() {
@@ -146,6 +137,7 @@ func TestBackendHealth(t *testing.T) {
 	}
 }
 
+// ... TestGetNextBackendByLeastConns, TestGetNextBackendByIP, TestGetNextBackendByRoundRobin, TestGetNextBackendByWeightedRoundRobin (no changes) ...
 func TestGetNextBackendByLeastConns(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -162,7 +154,6 @@ func TestGetNextBackendByLeastConns(t *testing.T) {
 		t.Errorf("Expected backend server2, but got %s", be.Addr)
 	}
 }
-
 func TestGetNextBackendByIP(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -178,7 +169,6 @@ func TestGetNextBackendByIP(t *testing.T) {
 		t.Errorf("IP Hashing failed: same IP got different backends")
 	}
 }
-
 func TestGetNextBackendByRoundRobin(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -196,11 +186,36 @@ func TestGetNextBackendByRoundRobin(t *testing.T) {
 		}
 	}
 }
-
-// Test for Weighted Round Robin
-// Test for Weighted Round Robin
 func TestGetNextBackendByWeightedRoundRobin(t *testing.T) {
-	// 1. Setup pool with weights 5, 1, 1
+	b1 := &Backend{Addr: "server1", Weight: 5}
+	b2 := &Backend{Addr: "server2", Weight: 1}
+	b3 := &Backend{Addr: "server3", Weight: 1}
+	pool := &BackendPool{
+		backends: []*Backend{b1, b2, b3},
+	}
+	b1.SetHealth(true)
+	b2.SetHealth(true)
+	b3.SetHealth(true)
+	expectedAddrs := []string{"server1", "server1", "server2", "server1", "server3", "server1", "server1"}
+	counts := make(map[string]int)
+	for _, expected := range expectedAddrs {
+		backend := pool.GetNextBackendByWeightedRoundRobin()
+		if backend.Addr != expected {
+			t.Errorf("Expected backend %s, but got %s", expected, backend.Addr)
+		}
+		counts[backend.Addr]++
+	}
+	if counts["server1"] != 5 || counts["server2"] != 1 || counts["server3"] != 1 {
+		t.Errorf("Incorrect distribution: got %v", counts)
+	}
+}
+
+// NEW: Test for Weighted Least Connections
+func TestGetNextBackendByWeightedLeastConns(t *testing.T) {
+	// 1. Setup pool
+	// b1: weight=5
+	// b2: weight=1
+	// b3: weight=1
 	b1 := &Backend{Addr: "server1", Weight: 5}
 	b2 := &Backend{Addr: "server2", Weight: 1}
 	b3 := &Backend{Addr: "server3", Weight: 1}
@@ -211,21 +226,44 @@ func TestGetNextBackendByWeightedRoundRobin(t *testing.T) {
 	b2.SetHealth(true)
 	b3.SetHealth(true)
 
-	// 2. Expected distribution over 7 requests (5+1+1)
-	// This is the correct trace of the algorithm.
-	expectedAddrs := []string{"server1", "server1", "server2", "server1", "server3", "server1", "server1"}
-
-	counts := make(map[string]int)
-	for _, expected := range expectedAddrs {
-		backend := pool.GetNextBackendByWeightedRoundRobin()
-		if backend.Addr != expected {
-			// This line is line 232 in your file
-			t.Errorf("Expected backend %s, but got %s", expected, backend.Addr)
-		}
-		counts[backend.Addr]++
+	// 2. Test initial state (all conns=0, all scores=0)
+	// It should pick the first one in the list, b1
+	be := pool.GetNextBackendByWeightedLeastConns()
+	if be.Addr != "server1" {
+		t.Errorf("Expected server1 (first in list), got %s", be.Addr)
 	}
 
-	if counts["server1"] != 5 || counts["server2"] != 1 || counts["server3"] != 1 {
-		t.Errorf("Incorrect distribution: got %v", counts)
+	// 3. Test with load
+	// b1: conns=5, weight=5 -> score = 1.0
+	// b2: conns=2, weight=1 -> score = 2.0
+	// b3: conns=1, weight=1 -> score = 1.0
+	b1.IncrementConnections() // 1
+	b1.IncrementConnections() // 2
+	b1.IncrementConnections() // 3
+	b1.IncrementConnections() // 4
+	b1.IncrementConnections() // 5
+	b2.IncrementConnections() // 1
+	b2.IncrementConnections() // 2
+	b3.IncrementConnections() // 1
+
+	// b1 and b3 have the same low score (1.0).
+	// It should pick the first one it finds: b1.
+	be = pool.GetNextBackendByWeightedLeastConns()
+	if be.Addr != "server1" {
+		t.Errorf("Expected server1 (score 1.0), got %s (score %f)",
+			be.Addr, float64(be.GetConnections())/float64(be.Weight))
+	}
+
+	// 4. Test again
+	// b1: conns=6, weight=5 -> score = 1.2
+	// b2: conns=2, weight=1 -> score = 2.0
+	// b3: conns=1, weight=1 -> score = 1.0
+	b1.IncrementConnections() // 6
+
+	// Now b3 has the best score (1.0)
+	be = pool.GetNextBackendByWeightedLeastConns()
+	if be.Addr != "server3" {
+		t.Errorf("Expected server3 (score 1.0), got %s (score %f)",
+			be.Addr, float64(be.GetConnections())/float64(be.Weight))
 	}
 }
