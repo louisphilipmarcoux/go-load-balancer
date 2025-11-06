@@ -1,0 +1,15 @@
+# --- Stage 1: Builder ---
+    FROM golang:1.25-alpine AS builder
+    WORKDIR /app
+    COPY go.mod go.sum ./
+    RUN go mod download
+    COPY cmd/backend/ cmd/backend/
+    COPY internal/backend/ internal/backend/
+    RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-w" -o /go-backend ./cmd/backend
+    
+    # --- Stage 2: Final ---
+    FROM alpine:3.20
+    RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+    USER appuser
+    COPY --from=builder /go-backend /go-backend
+    ENTRYPOINT ["/go-backend"]

@@ -1,0 +1,18 @@
+# Git
+.git
+.gitignore
+
+# Compiled binaries (we build them in the container)
+go-load-balancer
+cmd/backend/backend
+
+# OS-specific
+.DS_Store
+
+# Secrets & Certs (don't copy into the build context, mount them)
+*.key
+*.crt
+config.yaml
+
+# Logs
+*.log
