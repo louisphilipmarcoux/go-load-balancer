@@ -5,11 +5,18 @@ tls:
   certFile: "server.crt"
   keyFile: "server.key"
 
-# NEW: Add rate limiting config
 rateLimit:
   enabled: true
-  requestsPerSecond: 10 # 10 tokens added per second
-  burst: 20 # Bucket size of 20
+  requestsPerSecond: 10
+  burst: 20
+
+# NEW: Add circuit breaker config
+circuitBreaker:
+  enabled: true
+  # Trip after 5 consecutive failures
+  consecutiveFailures: 5
+  # After tripping, stay "OPEN" for 15 seconds
+  openStateTimeout: "15s"
 
 routes:
   - path: "/api/"

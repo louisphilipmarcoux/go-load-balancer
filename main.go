@@ -18,17 +18,19 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/time/rate" // NEW
+	"github.com/sony/gobreaker" // NEW
+	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
 
 // --- Config Structs ---
 type Config struct {
-	ListenAddr  string           `yaml:"listenAddr"`
-	MetricsAddr string           `yaml:"metricsAddr"`
-	TLS         *TLSConfig       `yaml:"tls"`
-	RateLimit   *RateLimitConfig `yaml:"rateLimit"` // NEW
-	Routes      []*RouteConfig   `yaml:"routes"`
+	ListenAddr     string                `yaml:"listenAddr"`
+	MetricsAddr    string                `yaml:"metricsAddr"`
+	TLS            *TLSConfig            `yaml:"tls"`
+	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
+	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"` // NEW
+	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
 type TLSConfig struct {
@@ -36,11 +38,17 @@ type TLSConfig struct {
 	KeyFile  string `yaml:"keyFile"`
 }
 
-// NEW: RateLimitConfig struct
 type RateLimitConfig struct {
 	Enabled           bool    `yaml:"enabled"`
 	RequestsPerSecond float64 `yaml:"requestsPerSecond"`
 	Burst             int     `yaml:"burst"`
+}
+
+// NEW: CircuitBreakerConfig struct
+type CircuitBreakerConfig struct {
+	Enabled             bool          `yaml:"enabled"`
+	ConsecutiveFailures uint32        `yaml:"consecutiveFailures"`
+	OpenStateTimeout    time.Duration `yaml:"openStateTimeout"`
 }
 
 // ... (RouteConfig, BackendConfig, LoadConfig - no changes) ...
@@ -74,7 +82,7 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // --- Backend Structs ---
-// ... (No changes to Backend struct or its methods) ...
+// CHANGED: Backend now holds its own CircuitBreaker
 type Backend struct {
 	Addr          string
 	healthy       bool
@@ -82,8 +90,10 @@ type Backend struct {
 	Weight        int
 	CurrentWeight int
 	connections   uint64
+	cb            *gobreaker.CircuitBreaker // NEW
 }
 
+// ... (IsHealthy, SetHealth, Inc/Dec/GetConnections - no changes) ...
 func (b *Backend) IsHealthy() bool {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
@@ -105,7 +115,6 @@ func (b *Backend) GetConnections() uint64 {
 }
 
 // --- BackendPool ---
-// ... (No changes to BackendPool or its methods) ...
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -113,16 +122,38 @@ type BackendPool struct {
 	lock     sync.Mutex
 }
 
-func NewBackendPool(strategy string, backendConfigs []*BackendConfig) *BackendPool {
+// CHANGED: NewBackendPool now initializes circuit breakers for each backend
+func NewBackendPool(strategy string, backendConfigs []*BackendConfig, cbCfg *CircuitBreakerConfig) *BackendPool {
 	backends := make([]*Backend, 0, len(backendConfigs))
 	for _, bc := range backendConfigs {
 		weight := 1
 		if bc.Weight > 0 {
 			weight = bc.Weight
 		}
+
+		var cb *gobreaker.CircuitBreaker
+		if cbCfg != nil && cbCfg.Enabled {
+			// Create settings for this backend's circuit breaker
+			st := gobreaker.Settings{
+				Name: bc.Addr,
+				// Count-based: trip after N consecutive failures
+				ReadyToTrip: func(counts gobreaker.Counts) bool {
+					return counts.ConsecutiveFailures > cbCfg.ConsecutiveFailures
+				},
+				// Cooldown period
+				Timeout: cbCfg.OpenStateTimeout,
+				// Log state changes
+				OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+					log.Printf("CircuitBreaker '%s' state changed: %s -> %s", name, from, to)
+				},
+			}
+			cb = gobreaker.NewCircuitBreaker(st)
+		}
+
 		backends = append(backends, &Backend{
 			Addr:   bc.Addr,
 			Weight: weight,
+			cb:     cb, // NEW
 		})
 	}
 	return &BackendPool{
@@ -130,6 +161,8 @@ func NewBackendPool(strategy string, backendConfigs []*BackendConfig) *BackendPo
 		strategy: strategy,
 	}
 }
+
+// ... (healthCheck - no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -149,6 +182,8 @@ func (p *BackendPool) healthCheck(b *Backend) {
 		b.SetHealth(true)
 	}
 }
+
+// CHANGED: StartHealthChecks now also skips health checks for "OPEN" circuits
 func (p *BackendPool) StartHealthChecks() {
 	log.Printf("Starting health checks for %d backends...", len(p.backends))
 	for _, b := range p.backends {
@@ -160,11 +195,18 @@ func (p *BackendPool) StartHealthChecks() {
 		for range ticker.C {
 			log.Println("Running scheduled health checks...")
 			for _, b := range p.backends {
+				// NEW: If circuit is OPEN, don't ping it. Let it rest.
+				if b.cb != nil && b.cb.State() == gobreaker.StateOpen {
+					log.Printf("Skipping health check for %s (circuit OPEN)", b.Addr)
+					continue
+				}
 				go p.healthCheck(b)
 			}
 		}
 	}()
 }
+
+// ... (GetTotalConnections - no changes) ...
 func (p *BackendPool) GetTotalConnections() uint64 {
 	var total uint64
 	for _, b := range p.backends {
@@ -174,7 +216,8 @@ func (p *BackendPool) GetTotalConnections() uint64 {
 }
 
 // --- Strategy Implementations ---
-// ... (No changes to strategy functions) ...
+
+// CHANGED: All GetNext... functions now skip backends whose circuit is "OPEN"
 func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
 	switch p.strategy {
 	case "ip-hash":
@@ -199,7 +242,8 @@ func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
-		if backend.IsHealthy() {
+		// NEW: Check health AND circuit state
+		if backend.IsHealthy() && (backend.cb == nil || backend.cb.State() != gobreaker.StateOpen) {
 			healthyBackends = append(healthyBackends, backend)
 		}
 	}
@@ -215,7 +259,8 @@ func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	var bestBackend *Backend
 	minConnections := uint64(math.MaxUint64)
 	for _, backend := range p.backends {
-		if !backend.IsHealthy() {
+		// NEW: Check health AND circuit state
+		if !backend.IsHealthy() || (backend.cb != nil && backend.cb.State() == gobreaker.StateOpen) {
 			continue
 		}
 		conns := backend.GetConnections()
@@ -234,7 +279,8 @@ func (p *BackendPool) GetNextBackendByRoundRobin() *Backend {
 	for i := uint64(0); i < numBackends; i++ {
 		index := atomic.AddUint64(&p.current, 1) % numBackends
 		backend := p.backends[index]
-		if backend.IsHealthy() {
+		// NEW: Check health AND circuit state
+		if backend.IsHealthy() && (backend.cb == nil || backend.cb.State() != gobreaker.StateOpen) {
 			return backend
 		}
 	}
@@ -246,7 +292,8 @@ func (p *BackendPool) GetNextBackendByWeightedRoundRobin() *Backend {
 	var bestBackend *Backend
 	totalWeight := 0
 	for _, backend := range p.backends {
-		if !backend.IsHealthy() {
+		// NEW: Check health AND circuit state
+		if !backend.IsHealthy() || (backend.cb != nil && backend.cb.State() == gobreaker.StateOpen) {
 			continue
 		}
 		backend.CurrentWeight += backend.Weight
@@ -265,7 +312,8 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	var bestBackend *Backend
 	minScore := math.Inf(1)
 	for _, backend := range p.backends {
-		if !backend.IsHealthy() {
+		// NEW: Check health AND circuit state
+		if !backend.IsHealthy() || (backend.cb != nil && backend.cb.State() == gobreaker.StateOpen) {
 			continue
 		}
 		conns := float64(backend.GetConnections())
@@ -279,14 +327,14 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	return bestBackend
 }
 
-// --- NEW: Rate Limiter ---
+// --- Rate Limiter ---
+// ... (No changes to RateLimiter) ...
 type RateLimiter struct {
 	clients map[string]*rate.Limiter
 	lock    sync.Mutex
 	rlCfg   *RateLimitConfig
 }
 
-// NewRateLimiter creates our IP-based rate limiter
 func NewRateLimiter(rlCfg *RateLimitConfig) *RateLimiter {
 	return &RateLimiter{
 		clients: make(map[string]*rate.Limiter),
@@ -294,15 +342,12 @@ func NewRateLimiter(rlCfg *RateLimitConfig) *RateLimiter {
 	}
 }
 
-// GetLimiter retrieves the limiter for a given IP, creating one if it doesn't exist.
 func (rl *RateLimiter) GetLimiter(ip string) *rate.Limiter {
 	rl.lock.Lock()
 	defer rl.lock.Unlock()
 
-	// Check if a limiter already exists for this IP
 	limiter, exists := rl.clients[ip]
 	if !exists {
-		// Create a new limiter if it doesn't
 		limiter = rate.NewLimiter(rate.Limit(rl.rlCfg.RequestsPerSecond), rl.rlCfg.Burst)
 		rl.clients[ip] = limiter
 	}
@@ -310,24 +355,24 @@ func (rl *RateLimiter) GetLimiter(ip string) *rate.Limiter {
 }
 
 // --- Proxy and LB ---
-// CHANGED: LoadBalancer now holds a RateLimiter
+// ... (LoadBalancer struct - no changes) ...
 type LoadBalancer struct {
 	cfg   *Config
 	mux   *http.ServeMux
 	pools map[string]*BackendPool
-	rl    *RateLimiter // NEW
+	rl    *RateLimiter
 	lock  sync.RWMutex
 }
 
-// ... (buildState - no changes) ...
+// CHANGED: buildState now passes circuit breaker config to NewBackendPool
 func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*BackendPool) {
 	mux := http.NewServeMux()
 	pools := make(map[string]*BackendPool)
 
 	for _, route := range cfg.Routes {
-		// Capture loop variables for the closure
 		route := route
-		pool := NewBackendPool(route.Strategy, route.Backends)
+		// NEW: Pass circuit breaker config
+		pool := NewBackendPool(route.Strategy, route.Backends, cfg.CircuitBreaker)
 		pool.StartHealthChecks()
 		pools[route.Path] = pool
 
@@ -335,23 +380,21 @@ func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*Bac
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			backend := pool.GetNextBackend(r)
 			if backend == nil {
-				log.Printf("No healthy backend found for path: %s", route.Path)
+				log.Printf("No healthy, non-tripped backend found for path: %s", route.Path)
 				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 				return
 			}
 
-			// Increment/Decrement connections if needed
+			// ... (Connection counting - no changes) ...
 			strategyNeedsConns := pool.strategy == "least-connections" ||
 				pool.strategy == "weighted-least-connections"
 			if strategyNeedsConns {
 				backend.IncrementConnections()
-				// Use defer in a closure to ensure it runs *after* proxy.ServeHTTP
 				defer func() {
 					backend.DecrementConnections()
 				}()
 			}
 
-			// Create the reverse proxy
 			targetUrl, err := url.Parse("http://" + backend.Addr)
 			if err != nil {
 				log.Printf("Failed to parse backend URL: %v", err)
@@ -360,18 +403,81 @@ func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*Bac
 			}
 			proxy := httputil.NewSingleHostReverseProxy(targetUrl)
 
-			// Log the L7 proxy action
-			log.Printf("L7 Proxy: %s %s -> %s", r.Method, r.URL.Path, backend.Addr)
+			// --- CIRCUIT BREAKER LOGIC ---
+			if backend.cb != nil {
+				// Execute the request *through* the circuit breaker
+				_, err := backend.cb.Execute(func() (interface{}, error) {
+					// This anonymous function is the "protected" action
+					log.Printf("L7 Proxy: %s %s -> %s (CB: %s)", r.Method, r.URL.Path, backend.Addr, backend.cb.State())
 
-			// proxy.ServeHTTP handles the request
-			proxy.ServeHTTP(w, r)
+					// We need a custom ErrorHandler to detect 5xx errors
+					proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+						// This error is a *connection* failure (e.g., dial error)
+						log.Printf("Backend error: %v", err)
+						// We'll return this error to the circuit breaker
+						// We must not write a response here, or the circuit breaker
+						// wrapper will panic.
+					}
+
+					// We need a custom ResponseModifier to detect 5xx responses
+					// This is a *bit* of a hack, as we're just checking status
+					// We use a custom response writer to capture the status code
+					recorder := &StatusRecorder{ResponseWriter: w, Status: http.StatusOK}
+
+					proxy.ServeHTTP(recorder, r)
+
+					// After the request, check the status code
+					if recorder.Status >= http.StatusInternalServerError {
+						// It was a 5xx error. Return an error to trip the circuit.
+						return nil, fmt.Errorf("backend %s returned status %d", backend.Addr, recorder.Status)
+					}
+
+					// No error
+					return nil, nil
+				})
+
+				// After Execute, check if the circuit was open
+				if err != nil {
+					// If err is gobreaker.ErrOpenState, the request was blocked
+					// If err is gobreaker.ErrTooManyRequests, it was blocked (HALF-OPEN)
+					// If it's any other error, it means our *protected function* failed
+
+					if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+						log.Printf("Request blocked for %s (CB: %s)", backend.Addr, backend.cb.State())
+						http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
+					} else {
+						// This was the 5xx error or connection error
+						// The proxy.ErrorHandler already logged it, but the
+						// ResponseWriter (recorder) already wrote the bad response.
+						// We just need to log that the failure was recorded.
+						log.Printf("Failure recorded for %s: %v", backend.Addr, err)
+					}
+				}
+				// If err is nil, the request succeeded, and response was written
+			} else {
+				// No circuit breaker, just proxy directly
+				log.Printf("L7 Proxy: %s %s -> %s", r.Method, r.URL.Path, backend.Addr)
+				proxy.ServeHTTP(w, r)
+			}
+			// --- END CIRCUIT BREAKER LOGIC ---
 		})
 		mux.Handle(route.Path, handler)
 	}
 	return mux, pools
 }
 
-// CHANGED: NewLoadBalancer now initializes the RateLimiter
+// NEW: StatusRecorder to capture the HTTP status code for the circuit breaker
+type StatusRecorder struct {
+	http.ResponseWriter
+	Status int
+}
+
+func (r *StatusRecorder) WriteHeader(status int) {
+	r.Status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+// ... (NewLoadBalancer, ServeHTTP, ReloadConfig, StartMetricsServer - no changes) ...
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{cfg: cfg}
 	lb.mux, lb.pools = lb.buildState(cfg)
@@ -380,8 +486,6 @@ func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	}
 	return lb
 }
-
-// CHANGED: ServeHTTP now checks the rate limiter first
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// --- RATE LIMITING LOGIC ---
 	lb.lock.RLock()
@@ -389,34 +493,26 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.lock.RUnlock()
 
 	if limiterEnabled {
-		// Get the client's IP
 		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			log.Printf("Failed to get client IP for rate limiting: %v", err)
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-
-		// Get the limiter for this IP
 		ipLimiter := lb.rl.GetLimiter(clientIP)
-
-		// Check if the request is allowed
 		if !ipLimiter.Allow() {
 			log.Printf("Rate limit exceeded for IP: %s", clientIP)
 			http.Error(w, "429 Too Many Requests", http.StatusTooManyRequests)
-			return // Stop processing the request
+			return
 		}
 	}
 	// --- END RATE LIMITING LOGIC ---
 
-	// If allowed, proceed to routing
 	lb.lock.RLock()
 	mux := lb.mux
 	lb.lock.RUnlock()
 	mux.ServeHTTP(w, r)
 }
-
-// CHANGED: ReloadConfig now rebuilds the rate limiter
 func (lb *LoadBalancer) ReloadConfig(path string) error {
 	log.Println("Reloading configuration from", path)
 	cfg, err := LoadConfig(path)
@@ -434,25 +530,22 @@ func (lb *LoadBalancer) ReloadConfig(path string) error {
 	lb.cfg = cfg
 	lb.mux = newMux
 	lb.pools = newPools
-	lb.rl = newRl // Atomically swap the rate limiter
+	lb.rl = newRl
 	lb.lock.Unlock()
 
 	log.Println("Configuration successfully reloaded.")
 	return nil
 }
-
-// ... (StartMetricsServer - no changes) ...
 func StartMetricsServer(addr string, lb *LoadBalancer) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		lb.lock.RLock()
-		pools := lb.pools // Get the current map of pools
+		pools := lb.pools
 		lb.lock.RUnlock()
 
 		var body string
 		var totalConns uint64
 
-		// Loop over each route and its pool
 		for path, pool := range pools {
 			totalConns += pool.GetTotalConnections()
 			for _, b := range pool.backends {
@@ -460,10 +553,24 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 				if b.IsHealthy() {
 					health = 1
 				}
-				// Add a "route" label to distinguish backends
 				body += fmt.Sprintf("backend_health_status{backend=\"%s\", route=\"%s\"} %d\n", b.Addr, path, health)
 				conns := b.GetConnections()
 				body += fmt.Sprintf("backend_active_connections{backend=\"%s\", route=\"%s\"} %d\n", b.Addr, path, conns)
+
+				// NEW: Export circuit breaker state
+				if b.cb != nil {
+					state := b.cb.State()
+					var stateNum int
+					switch state {
+					case gobreaker.StateClosed:
+						stateNum = 0
+					case gobreaker.StateHalfOpen:
+						stateNum = 1
+					case gobreaker.StateOpen:
+						stateNum = 2
+					}
+					body += fmt.Sprintf("backend_circuit_state{backend=\"%s\", route=\"%s\"} %d\n", b.Addr, path, stateNum)
+				}
 			}
 		}
 		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
@@ -488,31 +595,24 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Create the central LoadBalancer (which is an http.Handler)
 	lb := NewLoadBalancer(cfg)
 
-	// Create the main HTTP server
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: lb,
 	}
 
-	// Start the metrics server in a goroutine
 	if cfg.MetricsAddr != "" {
 		go StartMetricsServer(cfg.MetricsAddr, lb)
 	}
 
-	// Start the main load balancer server in a goroutine
 	go func() {
-		// --- THIS IS THE KEY CHANGE ---
 		if cfg.TLS != nil {
-			// Start an HTTPS server
 			log.Printf("Load Balancer (L7/TLS) listening on %s", server.Addr)
 			if err := server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Fatalf("Failed to run TLS load balancer: %v", err)
 			}
 		} else {
-			// Start a plain HTTP server
 			log.Printf("Load Balancer (L7/HTTP) listening on %s", server.Addr)
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Fatalf("Failed to run HTTP load balancer: %v", err)
@@ -520,14 +620,12 @@ func main() {
 		}
 	}()
 
-	// --- Signal handling for shutdown AND reload ---
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	for sig := range sigChan {
 		switch sig {
 		case syscall.SIGINT, syscall.SIGTERM:
-			// --- Graceful Shutdown ---
 			log.Println("Shutting down... Stopping new connections.")
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -537,10 +635,9 @@ func main() {
 			} else {
 				log.Println("Graceful shutdown complete.")
 			}
-			return // Exit main
+			return
 
 		case syscall.SIGHUP:
-			// --- Hot Reload ---
 			if err := lb.ReloadConfig(configPath); err != nil {
 				log.Printf("Failed to reload config: %v", err)
 			}
