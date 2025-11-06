@@ -1,25 +1,34 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/http"
+	"net/http" // NEW
 	"strings"
+
+	// "sync" // No longer needed
 	"testing"
 	"time"
+
+	"context" // NEW
 
 	"github.com/louisphilipmarcoux/go-load-balancer/backend"
 )
 
 // --- CHANGED THIS BLOCK ---
-// Add a const for the test metrics server
+// We now need multiple backends for L7 routing tests
 const (
 	lbAddr      = "localhost:8080"
-	backendAddr = "localhost:9099"
-	metricsAddr = "localhost:9090" // NEW
-	backendID   = "Test-Server-1"
+	metricsAddr = "localhost:9090"
+	// Backend for /api
+	backendAddrAPI = "localhost:9091"
+	backendID_API  = "API-Server-1"
+	// Backend for /
+	backendAddrWeb = "localhost:9092"
+	backendID_Web  = "Web-Server-1"
 )
 
 // --- END OF CHANGE ---
@@ -42,53 +51,68 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
-// --- CHANGED: Update TestMain to use LoadBalancer struct ---
+// CHANGED: TestMain now sets up L7 routing
 func TestMain(m *testing.M) {
-	backendListener, err := backend.RunServer("9099", backendID)
+	// Start API server
+	apiListener, err := backend.RunServer("9091", backendID_API)
 	if err != nil {
-		log.Fatalf("Failed to start backend server: %v", err)
+		log.Fatalf("Failed to start API backend server: %v", err)
 	}
-	defer func() {
-		if err := backendListener.Close(); err != nil {
-			log.Printf("Warning: failed to close backend listener: %v", err)
-		}
-	}()
+	defer func() { _ = apiListener.Close() }()
 
+	// Start Web server
+	webListener, err := backend.RunServer("9092", backendID_Web)
+	if err != nil {
+		log.Fatalf("Failed to start Web backend server: %v", err)
+	}
+	defer func() { _ = webListener.Close() }()
+
+	// Create a test config for L7 routing
 	cfg := &Config{
 		ListenAddr:  lbAddr,
 		MetricsAddr: metricsAddr,
-		Strategy:    "round-robin",
-		Backends:    []*BackendConfig{{Addr: backendAddr, Weight: 1}},
+		Routes: []*RouteConfig{
+			{
+				Path:     "/api/",
+				Strategy: "round-robin",
+				Backends: []*BackendConfig{{Addr: backendAddrAPI, Weight: 1}},
+			},
+			{
+				Path:     "/",
+				Strategy: "round-robin",
+				Backends: []*BackendConfig{{Addr: backendAddrWeb, Weight: 1}},
+			},
+		},
 	}
 
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		log.Fatalf("Failed to create listener for test: %v", err)
+	// Create the new LoadBalancer (which is an http.Handler)
+	lb := NewLoadBalancer(cfg)
+
+	// Manually set health for the test pools
+	lb.pools["/api/"].backends[0].SetHealth(true)
+	lb.pools["/"].backends[0].SetHealth(true)
+
+	// Create and start the main LB server
+	server := &http.Server{
+		Addr:    cfg.ListenAddr,
+		Handler: lb,
 	}
-	defer func() {
-		if err := listener.Close(); err != nil {
-			log.Printf("Warning: failed to close test listener: %v", err)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("LB server exited: %v", err)
 		}
 	}()
-
-	// Create the new LoadBalancer struct
-	lb := NewLoadBalancer(cfg, listener)
-	// Manually set health for the test, since we're not running StartHealthChecks
-	lb.pool.backends[0].SetHealth(true)
+	defer func() { _ = server.Shutdown(context.Background()) }()
 
 	// Start the metrics server
 	go StartMetricsServer(cfg.MetricsAddr, lb)
 
-	// Start the main LB run loop
-	go func() {
-		if err := lb.Run(); err != nil {
-			log.Printf("LB exited: %v", err)
-		}
-	}()
-
-	// Wait for all servers
-	if err := waitForPort(backendAddr, 2*time.Second); err != nil {
-		log.Fatalf("Backend server failed to start: %v", err)
+	// Wait for all 4 servers
+	if err := waitForPort(backendAddrAPI, 2*time.Second); err != nil {
+		log.Fatalf("API Backend server failed to start: %v", err)
+	}
+	if err := waitForPort(backendAddrWeb, 2*time.Second); err != nil {
+		log.Fatalf("Web Backend server failed to start: %v", err)
 	}
 	if err := waitForPort(lbAddr, 2*time.Second); err != nil {
 		log.Fatalf("Load balancer failed to start: %v", err)
@@ -100,62 +124,48 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// ... (All other tests remain the same) ...
-func TestProxyRequest(t *testing.T) {
-	resp, err := http.Get("http://" + lbAddr)
+// NEW: TestL7Routing replaces TestProxyRequest
+func TestL7Routing(t *testing.T) {
+	// Test 1: Request to /api/users should go to API server
+	respAPI, err := http.Get("http://" + lbAddr + "/api/users")
 	if err != nil {
-		t.Fatalf("Failed to make request to load balancer: %v", err)
+		t.Fatalf("Failed to make /api request: %v", err)
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			t.Logf("Warning: failed to close response body: %v", err)
-		}
-	}()
-	body, err := io.ReadAll(resp.Body)
+	defer func() { _ = respAPI.Body.Close() }()
+	bodyAPI, _ := io.ReadAll(respAPI.Body)
+
+	if !strings.Contains(string(bodyAPI), backendID_API) {
+		t.Errorf("Expected /api request to hit %s, got %q", backendID_API, string(bodyAPI))
+	}
+
+	// Test 2: Request to / should go to Web server
+	respWeb, err := http.Get("http://" + lbAddr + "/")
 	if err != nil {
-		t.Fatalf("Failed to read response body: %v", err)
+		t.Fatalf("Failed to make / request: %v", err)
 	}
-	expectedResponse := "Hello from backend server: " + backendID
-	if !strings.Contains(string(body), expectedResponse) {
-		t.Errorf("Unexpected response body. Got %q, expected to contain %q", string(body), expectedResponse)
+	defer func() { _ = respWeb.Body.Close() }()
+	bodyWeb, _ := io.ReadAll(respWeb.Body)
+
+	if !strings.Contains(string(bodyWeb), backendID_Web) {
+		t.Errorf("Expected / request to hit %s, got %q", backendID_Web, string(bodyWeb))
+	}
+
+	// Test 3: Request to /foo should also go to Web server
+	respFoo, err := http.Get("http://" + lbAddr + "/foo")
+	if err != nil {
+		t.Fatalf("Failed to make /foo request: %v", err)
+	}
+	defer func() { _ = respFoo.Body.Close() }()
+	bodyFoo, _ := io.ReadAll(respFoo.Body)
+
+	if !strings.Contains(string(bodyFoo), backendID_Web) {
+		t.Errorf("Expected /foo request to hit %s, got %q", backendID_Web, string(bodyFoo))
 	}
 }
-func TestHandleProxy_Unit(t *testing.T) {
-	clientConn, clientPipe := net.Pipe()
-	backendConn, backendPipe := net.Pipe()
-	go handleProxy(clientPipe, backendPipe)
-	go func() {
-		defer func() {
-			if err := backendConn.Close(); err != nil {
-				t.Logf("Warning: failed to close backend pipe: %v", err)
-			}
-		}()
-		buf := make([]byte, 5)
-		if _, err := backendConn.Read(buf); err != nil {
-			t.Errorf("Fake backend failed to read: %v", err)
-			return
-		}
-		if string(buf) != "hello" {
-			t.Errorf("Fake backend expected 'hello', got %q", string(buf))
-		}
-		if _, err := backendConn.Write([]byte("world")); err != nil {
-			t.Errorf("Fake backend failed to write: %v", err)
-		}
-	}()
-	if _, err := clientConn.Write([]byte("hello")); err != nil {
-		t.Fatalf("Client write error: %v", err)
-	}
-	buf := make([]byte, 5)
-	if _, err := clientConn.Read(buf); err != nil {
-		t.Fatalf("Client read error: %v", err)
-	}
-	if string(buf) != "world" {
-		t.Fatalf("Client expected 'world', got %q", string(buf))
-	}
-	if err := clientConn.Close(); err != nil {
-		t.Logf("Warning: failed to close client pipe: %v", err)
-	}
-}
+
+// GONE: TestHandleProxy_Unit is no longer relevant
+
+// ... (TestBackendHealth, LeastConns, IP, RoundRobin, Weighted... are all UNCHANGED) ...
 func TestBackendHealth(t *testing.T) {
 	b := &Backend{}
 	if b.IsHealthy() {
@@ -276,32 +286,27 @@ func TestGetNextBackendByWeightedLeastConns(t *testing.T) {
 	}
 }
 
-// NEW: Test for the metrics server
+// CHANGED: TestMetricsServer now checks for new L7 labels
 func TestMetricsServer(t *testing.T) {
-	// 1. Make a request to the metrics server
 	resp, err := http.Get("http://" + metricsAddr + "/metrics")
 	if err != nil {
 		t.Fatalf("Failed to make request to metrics server: %v", err)
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			t.Logf("Warning: failed to close metrics response body: %v", err)
-		}
-	}()
-
-	// 2. Read the response
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("Failed to read metrics response body: %v", err)
 	}
 
 	// 3. Verify the response
-	// We're testing against the *test* server (Test-Server-1 on port 9099)
-	// which we set to healthy=true in TestMain.
 	expectedMetrics := []string{
 		"total_active_connections 0",
-		fmt.Sprintf("backend_health_status{backend=\"%s\"} 1", backendAddr),
-		fmt.Sprintf("backend_active_connections{backend=\"%s\"} 0", backendAddr),
+		// API Server
+		fmt.Sprintf("backend_health_status{backend=\"%s\", route=\"/api/\"} 1", backendAddrAPI),
+		fmt.Sprintf("backend_active_connections{backend=\"%s\", route=\"/api/\"} 0", backendAddrAPI),
+		// Web Server
+		fmt.Sprintf("backend_health_status{backend=\"%s\", route=\"/\"} 1", backendAddrWeb),
+		fmt.Sprintf("backend_active_connections{backend=\"%s\", route=\"/\"} 0", backendAddrWeb),
 	}
 
 	for _, expected := range expectedMetrics {
