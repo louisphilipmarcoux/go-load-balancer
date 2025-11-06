@@ -10,24 +10,29 @@ rateLimit:
   requestsPerSecond: 10
   burst: 20
 
-# NEW: Add circuit breaker config
 circuitBreaker:
   enabled: true
-  # Trip after 5 consecutive failures
   consecutiveFailures: 5
-  # After tripping, stay "OPEN" for 15 seconds
   openStateTimeout: "15s"
 
 routes:
-  - path: "/api/"
+  # NEW: Route for a specific host
+  - host: "api.example.com"
+    path: "/"
     strategy: "round-robin"
     backends:
-      - addr: "localhost:9001"
-        weight: 1
+      - addr: "localhost:9001" # API server
+
+  # NEW: Route for a specific header (e.g., mobile users)
+  - path: "/"
+    headers:
+      "User-Agent": "MobileApp"
+    strategy: "round-robin"
+    backends:
+      - addr: "localhost:9002" # Mobile-specific server
+
+  # Default route for everyone else
   - path: "/"
     strategy: "weighted-least-connections"
     backends:
-      - addr: "localhost:9002"
-        weight: 5
-      - addr: "localhost:9003"
-        weight: 1
+      - addr: "localhost:9003" # Main web server
