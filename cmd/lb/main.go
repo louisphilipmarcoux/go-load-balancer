@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/louisphilipmarcoux/go-load-balancer/internal/lb"
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// ... (startAutocertChallengeServer - no change) ...
 func startAutocertChallengeServer(certManager *autocert.Manager) *http.Server {
 	server := &http.Server{
 		Addr:    ":80",
@@ -44,12 +44,13 @@ func main() {
 	// --- End Logger Setup ---
 
 	configPath := "config.yaml"
-	cfg, err := LoadConfig(configPath)
+	cfg, err := lb.LoadConfig(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	lb := NewLoadBalancer(cfg)
+	// Renamed from 'lb' to 'loadBalancer' to avoid shadowing the package name
+	loadBalancer := lb.NewLoadBalancer(cfg)
 
 	var tlsConfig *tls.Config
 	var autocertServer *http.Server
@@ -73,7 +74,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:      cfg.ListenAddr,
-		Handler:   lb,
+		Handler:   loadBalancer,
 		TLSConfig: tlsConfig,
 	}
 
@@ -100,12 +101,12 @@ func main() {
 	}()
 
 	if cfg.MetricsAddr != "" {
-		go StartMetricsServer(cfg.MetricsAddr, lb)
+		go lb.StartMetricsServer(cfg.MetricsAddr, loadBalancer)
 	}
 
 	var adminServer *http.Server
 	if cfg.AdminAddr != "" {
-		adminServer = StartAdminServer(lb)
+		adminServer = lb.StartAdminServer(loadBalancer)
 	}
 
 	sigChan := make(chan os.Signal, 1)
@@ -158,12 +159,13 @@ func main() {
 			return
 
 		case syscall.SIGHUP:
-			slog.Info("Reloading configuration from disk...")
-			newCfg, err := LoadConfig(configPath)
+			slog.Info("SIGHUP received, reloading configuration...")
+			newCfg, err := lb.LoadConfig(configPath)
 			if err != nil {
 				slog.Error("Failed to reload config", "error", err)
 			} else {
-				lb.ReloadConfig(newCfg)
+				loadBalancer.ReloadConfig(newCfg)
+				slog.Info("Configuration successfully reloaded")
 			}
 		}
 	}

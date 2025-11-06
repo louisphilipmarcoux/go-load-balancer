@@ -1,4 +1,4 @@
-package main
+package lb
 
 import (
 	"bytes"
@@ -43,6 +43,7 @@ type LoadBalancer struct {
 	cache  *cache.Cache
 	lock   sync.RWMutex
 }
+
 type CacheItem struct {
 	Status int
 	Header http.Header

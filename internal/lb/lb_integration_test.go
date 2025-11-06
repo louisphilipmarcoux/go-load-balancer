@@ -1,4 +1,4 @@
-package main
+package lb
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/louisphilipmarcoux/go-load-balancer/backend"
+	"github.com/louisphilipmarcoux/go-load-balancer/internal/backend"
 )
 
 // ... (Constants - no changes) ...
@@ -71,8 +71,8 @@ func TestMain(m *testing.M) {
 		ListenAddr:  lbAddr,
 		MetricsAddr: metricsAddr,
 		TLS: &TLSConfig{
-			CertFile: "server.crt",
-			KeyFile:  "server.key",
+			CertFile: "../../server.crt",
+			KeyFile:  "../../server.key",
 		},
 		// NEW: Add a (small) connection pool for testing
 		ConnectionPool: &ConnectionPoolConfig{

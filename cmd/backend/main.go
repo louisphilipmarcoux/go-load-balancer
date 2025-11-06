@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/louisphilipmarcoux/go-load-balancer/backend"
+	"github.com/louisphilipmarcoux/go-load-balancer/internal/backend"
 )
 
 func main() {
