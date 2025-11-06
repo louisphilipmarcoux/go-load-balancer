@@ -1,5 +1,5 @@
 listenAddr: ":8080"
-strategy: "weighted-round-robin" # Set this to test
+strategy: "weighted-least-connections"
 backends:
   - addr: "localhost:9001"
     weight: 5 # This server gets 5x the traffic

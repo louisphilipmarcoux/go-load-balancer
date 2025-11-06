@@ -9,20 +9,21 @@ import (
 	"math"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// --- Config Structs ---
+// ... (No changes to Config, Backend, BackendPool, or any strategy functions) ...
 type Config struct {
 	ListenAddr string           `yaml:"listenAddr"`
 	Strategy   string           `yaml:"strategy"`
 	Backends   []*BackendConfig `yaml:"backends"`
 }
-
 type BackendConfig struct {
 	Addr   string `yaml:"addr"`
 	Weight int    `yaml:"weight"`
@@ -46,17 +47,15 @@ func LoadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// --- Backend Structs ---
 type Backend struct {
 	Addr          string
 	healthy       bool
 	lock          sync.RWMutex
 	Weight        int
-	CurrentWeight int // Used by Weighted Round Robin
+	CurrentWeight int
 	connections   uint64
 }
 
-// ... IsHealthy, SetHealth, IncrementConnections, DecrementConnections, GetConnections (no changes) ...
 func (b *Backend) IsHealthy() bool {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
@@ -77,7 +76,6 @@ func (b *Backend) GetConnections() uint64 {
 	return atomic.LoadUint64(&b.connections)
 }
 
-// --- BackendPool ---
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -88,7 +86,7 @@ type BackendPool struct {
 func NewBackendPool(cfg *Config) *BackendPool {
 	backends := make([]*Backend, 0, len(cfg.Backends))
 	for _, bc := range cfg.Backends {
-		weight := 1 // Default weight
+		weight := 1
 		if bc.Weight > 0 {
 			weight = bc.Weight
 		}
@@ -102,8 +100,6 @@ func NewBackendPool(cfg *Config) *BackendPool {
 		strategy: cfg.Strategy,
 	}
 }
-
-// ... healthCheck, StartHealthChecks (no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -139,9 +135,6 @@ func (p *BackendPool) StartHealthChecks() {
 		}
 	}()
 }
-
-// --- Strategy Implementations ---
-// ... GetNextBackendByIP, GetNextBackendByLeastConns, GetNextBackendByRoundRobin, GetNextBackendByWeightedRoundRobin (no changes) ...
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -207,35 +200,23 @@ func (p *BackendPool) GetNextBackendByWeightedRoundRobin() *Backend {
 	bestBackend.CurrentWeight -= totalWeight
 	return bestBackend
 }
-
-// NEW: GetNextBackendByWeightedLeastConns
 func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	var bestBackend *Backend
-	minScore := math.Inf(1) // Start with positive infinity
-
+	minScore := math.Inf(1)
 	for _, backend := range p.backends {
 		if !backend.IsHealthy() {
 			continue
 		}
-
 		conns := float64(backend.GetConnections())
 		weight := float64(backend.Weight)
-
-		// Calculate score: conns / weight
-		// A backend with 0 connections will always have the best score (0)
-		// A backend with 0 weight (if allowed) would be problematic, but our NewBackendPool prevents this.
 		score := conns / weight
-
 		if score < minScore {
 			minScore = score
 			bestBackend = backend
 		}
 	}
-
 	return bestBackend
 }
-
-// ... handleProxy (no changes) ...
 func handleProxy(client, backend net.Conn) {
 	defer func() {
 		if err := client.Close(); err != nil {
@@ -266,35 +247,26 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// CHANGED: Add new strategy to the switch and update connection counting
-func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := listener.Close(); err != nil {
-			log.Printf("Warning: failed to close listener: %v", err)
-		}
-	}()
-
-	log.Printf("Load Balancer listening on %s, strategy: %s", cfg.ListenAddr, cfg.Strategy)
+func RunLoadBalancer(cfg *Config, pool *BackendPool, listener net.Listener, wg *sync.WaitGroup) error {
+	log.Printf("Load Balancer listening on %s, strategy: %s", listener.Addr().String(), cfg.Strategy)
 
 	for {
 		client, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				log.Println("Listener closed.")
+				log.Println("Listener closed. No longer accepting new connections.")
 				return nil
 			}
 			log.Printf("Failed to accept connection: %v", err)
 			continue
 		}
 
-		go func(c net.Conn) {
-			var backend *Backend
+		wg.Add(1)
 
-			// --- NEW: Check if the strategy needs connection counting ---
+		go func(c net.Conn) {
+			defer wg.Done()
+
+			var backend *Backend
 			strategyNeedsConns := pool.strategy == "least-connections" ||
 				pool.strategy == "weighted-least-connections"
 
@@ -309,17 +281,12 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 					return
 				}
 				backend = pool.GetNextBackendByIP(clientIP)
-
 			case "least-connections":
 				backend = pool.GetNextBackendByLeastConns()
-
-			// NEW: Add the "weighted-least-connections" case
 			case "weighted-least-connections":
 				backend = pool.GetNextBackendByWeightedLeastConns()
-
 			case "weighted-round-robin":
 				backend = pool.GetNextBackendByWeightedRoundRobin()
-
 			case "round-robin":
 				fallthrough
 			default:
@@ -334,21 +301,23 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 				return
 			}
 
-			// CHANGED: Use the new boolean
 			if strategyNeedsConns {
 				backend.IncrementConnections()
 				defer backend.DecrementConnections()
 			}
 
-			backendConn, err := net.Dial("tcp", backend.Addr)
+			// --- THIS IS THE FIX ---
+			// Use DialTimeout to prevent goroutines from hanging
+			backendConn, err := net.DialTimeout("tcp", backend.Addr, 3*time.Second)
+			// --- END OF FIX ---
+
 			if err != nil {
 				log.Printf("Failed to connect to backend: %s", backend.Addr)
 				if err := c.Close(); err != nil {
 					log.Printf("Warning: failed to close client connection on backend dial error: %v", err)
 				}
-				// CHANGED: Use the new boolean
 				if strategyNeedsConns {
-					backend.DecrementConnections() // Must decrement on dial error
+					backend.DecrementConnections()
 				}
 				return
 			}
@@ -358,7 +327,7 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 	}
 }
 
-// ... main (no changes) ...
+// ... main function (no changes) ...
 func main() {
 	cfg, err := LoadConfig("config.yaml")
 	if err != nil {
@@ -366,7 +335,33 @@ func main() {
 	}
 	pool := NewBackendPool(cfg)
 	pool.StartHealthChecks()
-	if err := RunLoadBalancer(cfg, pool); err != nil {
-		log.Fatalf("Failed to run load balancer: %v", err)
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		log.Fatalf("Failed to create listener: %v", err)
+	}
+	var wg sync.WaitGroup
+	go func() {
+		if err := RunLoadBalancer(cfg, pool, listener, &wg); err != nil {
+			log.Printf("Failed to run load balancer: %v", err)
+		}
+	}()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+	log.Println("Shutting down... Stopping new connections.")
+	if err := listener.Close(); err != nil {
+		log.Printf("Warning: failed to close listener: %v", err)
+	}
+	log.Println("Waiting for all active connections to finish...")
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Println("Graceful shutdown complete.")
+	case <-time.After(30 * time.Second):
+		log.Println("Shutdown timeout. Forcing exit.")
 	}
 }
