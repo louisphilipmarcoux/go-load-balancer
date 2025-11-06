@@ -24,12 +24,10 @@ type Config struct {
 }
 
 type BackendConfig struct {
-	Addr string `yaml:"addr"`
-	// NEW: Add Weight to the config
-	Weight int `yaml:"weight"`
+	Addr   string `yaml:"addr"`
+	Weight int    `yaml:"weight"`
 }
 
-// ... LoadConfig (no changes) ...
 func LoadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -50,10 +48,9 @@ func LoadConfig(path string) (*Config, error) {
 
 // --- Backend Structs ---
 type Backend struct {
-	Addr    string
-	healthy bool
-	lock    sync.RWMutex
-	// NEW: Add Weight and CurrentWeight
+	Addr          string
+	healthy       bool
+	lock          sync.RWMutex
 	Weight        int
 	CurrentWeight int // Used by Weighted Round Robin
 	connections   uint64
@@ -85,11 +82,9 @@ type BackendPool struct {
 	backends []*Backend
 	strategy string
 	current  uint64
-	// NEW: Add a lock for Weighted Round Robin
-	lock sync.Mutex
+	lock     sync.Mutex
 }
 
-// CHANGED: NewBackendPool now handles weights
 func NewBackendPool(cfg *Config) *BackendPool {
 	backends := make([]*Backend, 0, len(cfg.Backends))
 	for _, bc := range cfg.Backends {
@@ -128,7 +123,6 @@ func (p *BackendPool) healthCheck(b *Backend) {
 		b.SetHealth(true)
 	}
 }
-
 func (p *BackendPool) StartHealthChecks() {
 	log.Println("Starting health checks...")
 	for _, b := range p.backends {
@@ -147,7 +141,7 @@ func (p *BackendPool) StartHealthChecks() {
 }
 
 // --- Strategy Implementations ---
-// ... GetNextBackendByIP, GetNextBackendByLeastConns, GetNextBackendByRoundRobin (no changes) ...
+// ... GetNextBackendByIP, GetNextBackendByLeastConns, GetNextBackendByRoundRobin, GetNextBackendByWeightedRoundRobin (no changes) ...
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -163,7 +157,6 @@ func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	index := int(h.Sum32()) % len(healthyBackends)
 	return healthyBackends[index]
 }
-
 func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	var bestBackend *Backend
 	minConnections := uint64(math.MaxUint64)
@@ -179,7 +172,6 @@ func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	}
 	return bestBackend
 }
-
 func (p *BackendPool) GetNextBackendByRoundRobin() *Backend {
 	numBackends := uint64(len(p.backends))
 	if numBackends == 0 {
@@ -194,36 +186,51 @@ func (p *BackendPool) GetNextBackendByRoundRobin() *Backend {
 	}
 	return nil
 }
-
-// NEW: GetNextBackendByWeightedRoundRobin
 func (p *BackendPool) GetNextBackendByWeightedRoundRobin() *Backend {
-	// This lock is crucial for W-RR
 	p.lock.Lock()
 	defer p.lock.Unlock()
-
 	var bestBackend *Backend
 	totalWeight := 0
+	for _, backend := range p.backends {
+		if !backend.IsHealthy() {
+			continue
+		}
+		backend.CurrentWeight += backend.Weight
+		totalWeight += backend.Weight
+		if bestBackend == nil || backend.CurrentWeight > bestBackend.CurrentWeight {
+			bestBackend = backend
+		}
+	}
+	if bestBackend == nil {
+		return nil
+	}
+	bestBackend.CurrentWeight -= totalWeight
+	return bestBackend
+}
+
+// NEW: GetNextBackendByWeightedLeastConns
+func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
+	var bestBackend *Backend
+	minScore := math.Inf(1) // Start with positive infinity
 
 	for _, backend := range p.backends {
 		if !backend.IsHealthy() {
 			continue
 		}
 
-		// This is the core "Smooth Weighted Round Robin" logic
-		backend.CurrentWeight += backend.Weight
-		totalWeight += backend.Weight
+		conns := float64(backend.GetConnections())
+		weight := float64(backend.Weight)
 
-		if bestBackend == nil || backend.CurrentWeight > bestBackend.CurrentWeight {
+		// Calculate score: conns / weight
+		// A backend with 0 connections will always have the best score (0)
+		// A backend with 0 weight (if allowed) would be problematic, but our NewBackendPool prevents this.
+		score := conns / weight
+
+		if score < minScore {
+			minScore = score
 			bestBackend = backend
 		}
 	}
-
-	if bestBackend == nil {
-		return nil
-	}
-
-	// Adjust weights for the next round
-	bestBackend.CurrentWeight -= totalWeight
 
 	return bestBackend
 }
@@ -259,7 +266,7 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// CHANGED: Add new strategy to the switch
+// CHANGED: Add new strategy to the switch and update connection counting
 func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -287,6 +294,10 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 		go func(c net.Conn) {
 			var backend *Backend
 
+			// --- NEW: Check if the strategy needs connection counting ---
+			strategyNeedsConns := pool.strategy == "least-connections" ||
+				pool.strategy == "weighted-least-connections"
+
 			switch pool.strategy {
 			case "ip-hash":
 				clientIP, _, err := net.SplitHostPort(c.RemoteAddr().String())
@@ -302,12 +313,15 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 			case "least-connections":
 				backend = pool.GetNextBackendByLeastConns()
 
-			// NEW: Add the "weighted-round-robin" case
+			// NEW: Add the "weighted-least-connections" case
+			case "weighted-least-connections":
+				backend = pool.GetNextBackendByWeightedLeastConns()
+
 			case "weighted-round-robin":
 				backend = pool.GetNextBackendByWeightedRoundRobin()
 
 			case "round-robin":
-				fallthrough // Use Round Robin as the default
+				fallthrough
 			default:
 				backend = pool.GetNextBackendByRoundRobin()
 			}
@@ -320,7 +334,8 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 				return
 			}
 
-			if pool.strategy == "least-connections" {
+			// CHANGED: Use the new boolean
+			if strategyNeedsConns {
 				backend.IncrementConnections()
 				defer backend.DecrementConnections()
 			}
@@ -331,8 +346,9 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 				if err := c.Close(); err != nil {
 					log.Printf("Warning: failed to close client connection on backend dial error: %v", err)
 				}
-				if pool.strategy == "least-connections" {
-					backend.DecrementConnections()
+				// CHANGED: Use the new boolean
+				if strategyNeedsConns {
+					backend.DecrementConnections() // Must decrement on dial error
 				}
 				return
 			}
