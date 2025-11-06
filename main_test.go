@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -43,7 +42,7 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
-// CHANGED: Update TestMain to start metrics server
+// --- CHANGED: Update TestMain to use LoadBalancer struct ---
 func TestMain(m *testing.M) {
 	backendListener, err := backend.RunServer("9099", backendID)
 	if err != nil {
@@ -57,17 +56,10 @@ func TestMain(m *testing.M) {
 
 	cfg := &Config{
 		ListenAddr:  lbAddr,
-		MetricsAddr: metricsAddr, // NEW
+		MetricsAddr: metricsAddr,
 		Strategy:    "round-robin",
 		Backends:    []*BackendConfig{{Addr: backendAddr, Weight: 1}},
 	}
-	testPool := NewBackendPool(cfg)
-	testPool.backends[0].SetHealth(true)
-
-	// NEW: Start the metrics server for testing
-	// Note: We don't have a graceful shutdown for this in the test,
-	// but that's okay for now.
-	go StartMetricsServer(cfg.MetricsAddr, testPool)
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -78,9 +70,18 @@ func TestMain(m *testing.M) {
 			log.Printf("Warning: failed to close test listener: %v", err)
 		}
 	}()
-	var wg sync.WaitGroup
+
+	// Create the new LoadBalancer struct
+	lb := NewLoadBalancer(cfg, listener)
+	// Manually set health for the test, since we're not running StartHealthChecks
+	lb.pool.backends[0].SetHealth(true)
+
+	// Start the metrics server
+	go StartMetricsServer(cfg.MetricsAddr, lb)
+
+	// Start the main LB run loop
 	go func() {
-		if err := RunLoadBalancer(cfg, testPool, listener, &wg); err != nil {
+		if err := lb.Run(); err != nil {
 			log.Printf("LB exited: %v", err)
 		}
 	}()
@@ -92,7 +93,6 @@ func TestMain(m *testing.M) {
 	if err := waitForPort(lbAddr, 2*time.Second); err != nil {
 		log.Fatalf("Load balancer failed to start: %v", err)
 	}
-	// NEW: Wait for metrics server
 	if err := waitForPort(metricsAddr, 2*time.Second); err != nil {
 		log.Fatalf("Metrics server failed to start: %v", err)
 	}
