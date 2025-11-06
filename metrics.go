@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/sony/gobreaker"
@@ -21,16 +21,11 @@ type CachingRecorder struct {
 func (r *CachingRecorder) WriteHeader(status int) {
 	r.Status = status
 	r.wroteHeader = true
-	// Don't write to underlying writer yet!
-	// We'll do that at the very end.
 }
-
 func (r *CachingRecorder) Write(b []byte) (int, error) {
-	// Write to our buffer
 	return r.Body.Write(b)
 }
 
-// StartMetricsServer starts the /metrics endpoint
 func StartMetricsServer(addr string, lb *LoadBalancer) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -45,21 +40,16 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 		for _, route := range routes {
 			totalConns += route.pool.GetTotalConnections()
 			for _, b := range route.pool.backends {
+				// ... (metric generation logic - no changes) ...
 				health := 0
 				if b.IsHealthy() {
 					health = 1
 				}
 				label := fmt.Sprintf("backend=\"%s\", route_path=\"%s\", route_host=\"%s\"",
 					b.Addr, route.config.Path, route.config.Host)
-
 				body += fmt.Sprintf("backend_health_status{%s} %d\n", label, health)
-
-				// --- THIS IS THE FIX ---
 				conns := b.GetConnections()
-				// --- END OF FIX ---
-
 				body += fmt.Sprintf("backend_active_connections{%s} %d\n", label, conns)
-
 				if b.cb != nil {
 					state := b.cb.State()
 					var stateNum int
@@ -73,12 +63,10 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 					}
 					body += fmt.Sprintf("backend_circuit_state{%s} %d\n", label, stateNum)
 				}
-
-				body += "\n" // Add a newline to separate each backend's metrics
+				body += "\n"
 			}
 		}
-
-		body += "\n" // Add a newline to separate summary stats
+		body += "\n"
 		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
 		if cache != nil {
 			body += fmt.Sprintf("cache_item_count %d\n", cache.ItemCount())
@@ -86,12 +74,12 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 
 		w.Header().Set("Content-Type", "text/plain")
 		if _, err := w.Write([]byte(body)); err != nil {
-			log.Printf("Warning: failed to write metrics response: %v", err)
+			slog.Warn("Failed to write metrics response", "error", err)
 		}
 	})
 
-	log.Printf("Metrics server listening on %s", addr)
+	slog.Info("Metrics server listening", "addr", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Printf("Metrics server failed: %v", err)
+		slog.Error("Metrics server failed", "error", err)
 	}
 }

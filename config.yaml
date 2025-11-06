@@ -1,7 +1,6 @@
 listenAddr: ":8443"
 metricsAddr: ":9090"
 adminAddr: ":9091"
-adminToken: "ShonSODhVMtICMF44oG/aNz4BslDzOoBIwJLj85xZMU8Ym6ZyER+xutFi1y9REk/kINfK92vllgTufH7r3cfFg=="
 
 # NEW: Autocert configuration
 autocert:

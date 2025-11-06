@@ -2,19 +2,20 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log" // We still need 'log' for the fatal error in LoadConfig
 	"os"
 	"time"
 
+	"github.com/caarlos0/env/v9" // NEW
 	"gopkg.in/yaml.v3"
 )
 
-// ... (Config, TLSConfig, RateLimitConfig, CircuitBreakerConfig, ConnectionPoolConfig, CacheConfig - no changes) ...
+// Config is the top-level configuration
 type Config struct {
-	ListenAddr     string                `yaml:"listenAddr"`
-	MetricsAddr    string                `yaml:"metricsAddr"`
-	AdminAddr      string                `yaml:"adminAddr"`
-	AdminToken     string                `yaml:"adminToken"`
+	ListenAddr     string                `yaml:"listenAddr"     env:"LISTEN_ADDR"`
+	MetricsAddr    string                `yaml:"metricsAddr"    env:"METRICS_ADDR"`
+	AdminAddr      string                `yaml:"adminAddr"      env:"ADMIN_ADDR"`
+	AdminToken     string                `yaml:"adminToken"     env:"ADMIN_TOKEN"` // NEW ENV TAG
 	TLS            *TLSConfig            `yaml:"tls"`
 	Autocert       *AutocertConfig       `yaml:"autocert"`
 	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
@@ -24,43 +25,41 @@ type Config struct {
 	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
-// ADD THIS STRUCT BACK
 type TLSConfig struct {
-	CertFile string `yaml:"certFile"`
-	KeyFile  string `yaml:"keyFile"`
+	CertFile string `yaml:"certFile" env:"TLS_CERT_FILE"`
+	KeyFile  string `yaml:"keyFile"  env:"TLS_KEY_FILE"`
 }
 
-// NEW: AutocertConfig holds settings for Let's Encrypt
 type AutocertConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	Email    string   `yaml:"email"`
-	Domains  []string `yaml:"domains"`
-	CacheDir string   `yaml:"cacheDir"`
+	Enabled  bool     `yaml:"enabled"  env:"AUTOCERT_ENABLED"`
+	Email    string   `yaml:"email"    env:"AUTOCERT_EMAIL"`
+	Domains  []string `yaml:"domains"  env:"AUTOCERT_DOMAINS" envSeparator:","` // Comma-separated
+	CacheDir string   `yaml:"cacheDir" env:"AUTOCERT_CACHE_DIR"`
 }
+
+// ... (Add env tags to all other config structs as well) ...
 type RateLimitConfig struct {
-	Enabled           bool    `yaml:"enabled"`
-	RequestsPerSecond float64 `yaml:"requestsPerSecond"`
-	Burst             int     `yaml:"burst"`
+	Enabled           bool    `yaml:"enabled"           env:"RATE_LIMIT_ENABLED"`
+	RequestsPerSecond float64 `yaml:"requestsPerSecond" env:"RATE_LIMIT_RPS"`
+	Burst             int     `yaml:"burst"             env:"RATE_LIMIT_BURST"`
 }
 type CircuitBreakerConfig struct {
-	Enabled             bool          `yaml:"enabled"`
-	ConsecutiveFailures uint32        `yaml:"consecutiveFailures"`
-	OpenStateTimeout    time.Duration `yaml:"openStateTimeout"`
+	Enabled             bool          `yaml:"enabled"              env:"CB_ENABLED"`
+	ConsecutiveFailures uint32        `yaml:"consecutiveFailures"  env:"CB_CONSECUTIVE_FAILURES"`
+	OpenStateTimeout    time.Duration `yaml:"openStateTimeout"     env:"CB_TIMEOUT"`
 }
 type ConnectionPoolConfig struct {
-	MaxIdleConns        int           `yaml:"maxIdleConns"`
-	MaxIdleConnsPerHost int           `yaml:"maxIdleConnsPerHost"`
-	IdleConnTimeout     time.Duration `yaml:"idleConnTimeout"`
+	MaxIdleConns        int           `yaml:"maxIdleConns"        env:"POOL_MAX_IDLE_CONNS"`
+	MaxIdleConnsPerHost int           `yaml:"maxIdleConnsPerHost" env:"POOL_MAX_IDLE_PER_HOST"`
+	IdleConnTimeout     time.Duration `yaml:"idleConnTimeout"     env:"POOL_IDLE_TIMEOUT"`
 }
 type CacheConfig struct {
-	Enabled           bool          `yaml:"enabled"`
-	DefaultExpiration time.Duration `yaml:"defaultExpiration"`
-	CleanupInterval   time.Duration `yaml:"cleanupInterval"`
+	Enabled           bool          `yaml:"enabled"            env:"CACHE_ENABLED"`
+	DefaultExpiration time.Duration `yaml:"defaultExpiration"  env:"CACHE_EXPIRATION"`
+	CleanupInterval   time.Duration `yaml:"cleanupInterval"    env:"CACHE_CLEANUP_INTERVAL"`
 }
 
-// --- THIS BLOCK IS CHANGED ---
-
-// RouteConfig defines a single routing rule
+// ... (RouteConfig and BackendConfig are unchanged, as they are lists) ...
 type RouteConfig struct {
 	Host     string            `yaml:"host"     json:"host,omitempty"`
 	Path     string            `yaml:"path"     json:"path"`
@@ -68,30 +67,35 @@ type RouteConfig struct {
 	Strategy string            `yaml:"strategy" json:"strategy"`
 	Backends []*BackendConfig  `yaml:"backends" json:"backends"`
 }
-
-// BackendConfig defines a single backend server
 type BackendConfig struct {
 	Addr   string `yaml:"addr"   json:"addr"`
 	Weight int    `yaml:"weight" json:"weight"`
 }
 
-// --- END OF CHANGE ---
-
-// LoadConfig reads and parses the configuration file
+// LoadConfig now reads from YAML *and* overrides with Env Vars
 func LoadConfig(path string) (*Config, error) {
+	var cfg Config
+
+	// 1. Load from YAML file first
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open config file: %w", err)
 	}
 	defer func() {
 		if err := file.Close(); err != nil {
+			// Use standard log here, as slog isn't set up yet
 			log.Printf("Warning: failed to close config file: %v", err)
 		}
 	}()
-	var cfg Config
 	decoder := yaml.NewDecoder(file)
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to decode config YAML: %w", err)
 	}
+
+	// 2. NEW: Override with environment variables
+	if err := env.Parse(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse env vars: %w", err)
+	}
+
 	return &cfg, nil
 }
