@@ -27,8 +27,9 @@ services:
       - autocert_cache:/certs
     environment:
       # Set your log level and admin token from here
-      - LOG_LEVEL=DEBUG
-      - ADMIN_TOKEN=my-secret-docker-token-123
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - AUTOCERT_EMAIL=${AUTOCERT_EMAIL}
     depends_on:
       - backend1
       - backend2

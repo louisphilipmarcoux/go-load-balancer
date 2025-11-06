@@ -16,3 +16,6 @@ backend/backend
 
 # Let's Encrypt certificate cache
 certs/
+
+# Secrets
+.env

@@ -6,7 +6,7 @@ adminAddr: ":9091"
 autocert:
   enabled: false
   # Email for Let's Encrypt registration
-  email: "louisphilipmarcoux@gmail.com"
+  email: ""
   # Domains to manage (must be real, public domains)
   domains:
     - "lb.your-domain.com"
@@ -19,6 +19,11 @@ tls:
   certFile: "/certs/server.crt"
   keyFile: "/certs/server.key"
   minVersion: "tls1.2"
+  cipherSuites:
+    - "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+    - "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    - "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+    - "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
 
 rateLimit:
   enabled: true

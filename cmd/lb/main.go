@@ -18,6 +18,50 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
+// getTLSVersion maps a string config value to a Go tls.Version constant
+func getTLSVersion(version string) uint16 {
+	switch version {
+	case "tls1.0":
+		return tls.VersionTLS10
+	case "tls1.1":
+		return tls.VersionTLS11
+	case "tls1.2":
+		return tls.VersionTLS12
+	case "tls1.3":
+		return tls.VersionTLS13
+	default:
+		// Default to a strong version if config is missing or invalid
+		return tls.VersionTLS12
+	}
+}
+
+// getCipherSuites maps a list of string names to Go tls.CipherSuite constants
+func getCipherSuites(names []string) []uint16 {
+	if len(names) == 0 {
+		return nil // Use Go's default cipher suites
+	}
+
+	// This map is built from Go's standard tls.CipherSuites() list
+	suiteMap := make(map[string]uint16)
+	for _, suite := range tls.CipherSuites() {
+		suiteMap[suite.Name] = suite.ID
+	}
+	// Add Go's non-standard (but still valid) names
+	for _, suite := range tls.InsecureCipherSuites() {
+		suiteMap[suite.Name] = suite.ID
+	}
+
+	var suites []uint16
+	for _, name := range names {
+		if id, ok := suiteMap[name]; ok {
+			suites = append(suites, id)
+		} else {
+			slog.Warn("Unknown TLS cipher suite specified in config, skipping", "cipher", name)
+		}
+	}
+	return suites
+}
+
 func startAutocertChallengeServer(certManager *autocert.Manager) *http.Server {
 	server := &http.Server{
 		Addr:    ":80",
@@ -70,6 +114,10 @@ func main() {
 
 	} else if cfg.TLS != nil {
 		slog.Info("Using static TLS configuration")
+		tlsConfig = &tls.Config{
+			MinVersion:   getTLSVersion(cfg.TLS.MinVersion),
+			CipherSuites: getCipherSuites(cfg.TLS.CipherSuites),
+		}
 	} else {
 		slog.Info("TLS is not configured")
 	}
