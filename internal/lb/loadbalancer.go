@@ -3,11 +3,11 @@ package lb
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"net"
 	"net/http" // NEW
 	"strings"
