@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
 	"log"      // Keep for the one-time Fatalf
 	"log/slog" // NEW
 	"net/http"
@@ -43,8 +44,9 @@ func main() {
 	slog.SetDefault(logger)
 	// --- End Logger Setup ---
 
-	configPath := "config.yaml"
-	cfg, err := lb.LoadConfig(configPath)
+	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
+	flag.Parse()
+	cfg, err := lb.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
@@ -160,7 +162,7 @@ func main() {
 
 		case syscall.SIGHUP:
 			slog.Info("SIGHUP received, reloading configuration...")
-			newCfg, err := lb.LoadConfig(configPath)
+			newCfg, err := lb.LoadConfig(*configPath)
 			if err != nil {
 				slog.Error("Failed to reload config", "error", err)
 			} else {

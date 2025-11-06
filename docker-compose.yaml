@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # -------------------
+  # The Load Balancer
+  # -------------------
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: go-load-balancer
+    ports:
+      # Map host ports to container ports
+      - "8443:8443" # Main traffic
+      - "9090:9090" # Metrics
+      - "9091:9091" # Admin
+      - "80:80"     # Autocert
+    volumes:
+      # Mount your local config file directly into the container
+      - ./config.yaml:/config/config.yaml:ro
+      
+      # Mount your local certs (if using static TLS)
+      - ./server.crt:/certs/server.crt:ro
+      - ./server.key:/certs/server.key:ro
+      
+      # Create a persistent volume for Autocert's cache
+      - autocert_cache:/certs
+    environment:
+      # Set your log level and admin token from here
+      - LOG_LEVEL=DEBUG
+      - ADMIN_TOKEN=my-secret-docker-token-123
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+    
+  # -------------------
+  # Backend Servers
+  # -------------------
+  backend1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: backend-1
+    # This command starts the backend with a specific port and ID
+    # This port is INSIDE docker
+    command: ["-port", "9001", "Server-1"]
+    # No 'ports' needed; the 'lb' service can reach it
+    # by its Docker service name ('backend1:9001')
+
+  backend2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: backend-2
+    command: ["-port", "9002", "Server-2"]
+
+  backend3:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: backend-3
+    command: ["-port", "9003", "Server-3"]
+
+# Define the persistent volume for the cert cache
+volumes:
+  autocert_cache:

@@ -16,8 +16,8 @@ autocert:
 
 # NEW: ADD THIS SECTION BACK FOR LOCAL TESTING
 tls:
-  certFile: "server.crt"
-  keyFile: "server.key"
+  certFile: "/certs/server.crt"
+  keyFile: "/certs/server.key"
   minVersion: "tls1.2"
 
 rateLimit:
@@ -52,7 +52,7 @@ routes:
     path: "/"
     strategy: "round-robin"
     backends:
-      - addr: "localhost:9001"
+      - addr: "backend1:9001"
         weight: 1
 
   - path: "/"
@@ -60,7 +60,7 @@ routes:
       "User-Agent": "MobileApp"
     strategy: "round-robin"
     backends:
-      - addr: "localhost:9002"
+      - addr: "backend2:9002"
         weight: 1
 
   # ---
@@ -69,5 +69,5 @@ routes:
   - path: "/" # This catches everything else
     strategy: "weighted-least-connections"
     backends:
-      - addr: "localhost:9003"
+      - addr: "backend3:9003"
         weight: 1
