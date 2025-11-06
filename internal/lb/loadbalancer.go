@@ -2,6 +2,9 @@ package lb
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +16,11 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/sony/gobreaker"
 )
+
+// A private key type to prevent context collisions
+type contextKey string
+
+const loggerKey = contextKey("logger")
 
 // ... (Route struct, Matches, LoadBalancer struct, CacheItem, NewLoadBalancer - no changes) ...
 type Route struct {
@@ -50,6 +58,33 @@ type CacheItem struct {
 	Body   []byte
 }
 
+func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
+	newRoutes := lb.buildRoutes(cfg)
+	var newRl *RateLimiter
+	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
+		newRl = NewRateLimiter(cfg.RateLimit)
+	}
+	var newCache *cache.Cache
+	if cfg.Cache != nil && cfg.Cache.Enabled {
+		newCache = cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
+		slog.Info("Cache enabled", "expiration", cfg.Cache.DefaultExpiration)
+	}
+	lb.cfg = cfg
+	lb.routes = newRoutes
+	lb.rl = newRl
+	lb.cache = newCache
+	slog.Info("Configuration successfully reloaded (unsafe)")
+}
+
+// Add this method back to internal/lb/loadbalancer.go
+
+func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+	lb.reloadConfig_unsafe(cfg)
+	slog.Info("Configuration successfully reloaded (safe)")
+}
+
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
 	lb.ReloadConfig(cfg) // Calls the safe, locking version
@@ -68,6 +103,20 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 		)
 		pool.StartHealthChecks()
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// --- Start Logger Retrieval ---
+			// 1. Get the logger from the context
+			logger, ok := r.Context().Value(loggerKey).(*slog.Logger)
+			if !ok {
+				logger = slog.Default() // Fallback just in case
+			}
+
+			// 2. Add route-specific context!
+			logger = logger.With(
+				"route_path", routeCfg.Path,
+				"route_host", routeCfg.Host,
+			)
+			// --- End Logger Retrieval ---
+
 			lb.lock.RLock()
 			cacheEnabled := lb.cache != nil
 			lb.lock.RUnlock()
@@ -76,7 +125,8 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 			if cacheEnabled && r.Method == http.MethodGet {
 				cacheKey = r.Host + r.URL.Path
 				if item, found := lb.cache.Get(cacheKey); found {
-					slog.Debug("Cache hit", "key", cacheKey)
+					// Use our new logger
+					logger.Debug("Cache hit", "key", cacheKey)
 					cachedItem := item.(CacheItem)
 					for key, values := range cachedItem.Header {
 						for _, value := range values {
@@ -85,18 +135,23 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 					}
 					w.WriteHeader(cachedItem.Status)
 					if _, err := w.Write(cachedItem.Body); err != nil {
-						slog.Warn("Error writing cached response", "error", err)
+						logger.Warn("Error writing cached response", "error", err) // Use logger
 					}
 					return
 				}
-				slog.Debug("Cache miss", "key", cacheKey)
+				logger.Debug("Cache miss", "key", cacheKey) // Use logger
 			}
 			backend := pool.GetNextBackend(r)
 			if backend == nil {
-				slog.Warn("No healthy backend found for request", "host", r.Host, "path", r.URL.Path)
+				// Use logger. All context (req_id, client_ip, route) is added automatically.
+				logger.Warn("No healthy backend found for request")
 				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 				return
 			}
+
+			// Add backend context for all subsequent logs
+			logger = logger.With("backend_addr", backend.Addr)
+
 			strategyNeedsConns := pool.strategy == "least-connections" || pool.strategy == "weighted-least-connections"
 			if strategyNeedsConns {
 				backend.IncrementConnections()
@@ -112,9 +167,9 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 			var requestErr error
 			if backend.cb != nil {
 				_, requestErr = backend.cb.Execute(func() (interface{}, error) {
-					slog.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr, "circuit_state", backend.cb.State().String())
+					logger.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr, "circuit_state", backend.cb.State().String())
 					backend.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-						slog.Warn("Backend connection error", "backend", backend.Addr, "error", err)
+						logger.Warn("Backend connection error", "backend", backend.Addr, "error", err)
 					}
 					backend.proxy.ServeHTTP(recorder, r)
 					if recorder.Status >= http.StatusInternalServerError {
@@ -123,15 +178,15 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 					return nil, nil
 				})
 			} else {
-				slog.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr)
+				logger.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr)
 				backend.proxy.ServeHTTP(recorder, r)
 			}
 			if requestErr != nil {
 				if errors.Is(requestErr, gobreaker.ErrOpenState) || errors.Is(requestErr, gobreaker.ErrTooManyRequests) {
-					slog.Warn("Request blocked by circuit breaker", "backend", backend.Addr, "state", backend.cb.State().String())
+					logger.Warn("Request blocked by circuit breaker", "backend", backend.Addr, "state", backend.cb.State().String())
 					http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
 				} else {
-					slog.Warn("Circuit breaker failure recorded", "backend", backend.Addr, "error", requestErr)
+					logger.Warn("Circuit breaker failure recorded", "backend", backend.Addr, "error", requestErr)
 					if !recorder.wroteHeader {
 						http.Error(w, "Bad Gateway", http.StatusBadGateway)
 					}
@@ -144,14 +199,14 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 					Header: recorder.Header().Clone(),
 					Body:   recorder.Body.Bytes(),
 				}
-				slog.Debug("Caching response", "key", cacheKey, "size_bytes", len(item.Body))
+				logger.Debug("Caching response", "key", cacheKey, "size_bytes", len(item.Body))
 				lb.cache.Set(cacheKey, item, cache.DefaultExpiration)
 			}
 			if !recorder.wroteHeader {
 				recorder.ResponseWriter.WriteHeader(recorder.Status)
 			}
 			if _, err := recorder.ResponseWriter.Write(recorder.Body.Bytes()); err != nil {
-				slog.Warn("Error writing final response", "error", err)
+				logger.Warn("Error writing final response", "error", err)
 			}
 		})
 		routes = append(routes, &Route{
@@ -168,23 +223,43 @@ func (lb *LoadBalancer) getRoutes() []*Route {
 	return lb.routes
 }
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// --- Start Contextual Logger ---
+	// 1. Generate a unique Request ID
+	reqIDBytes := make([]byte, 6)
+	if _, err := rand.Read(reqIDBytes); err != nil {
+		slog.Warn("Failed to generate request ID", "error", err) // Use global logger for this one error
+	}
+	reqID := hex.EncodeToString(reqIDBytes)
+
+	// 2. Get Client IP
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+	// 3. Create a new logger with request-specific attributes
+	logger := slog.Default().With(
+		"req_id", reqID,
+		"client_ip", clientIP,
+	)
+
+	// 4. Store the logger in the request's context
+	r = r.WithContext(context.WithValue(r.Context(), loggerKey, logger))
+	// --- End Contextual Logger ---
+
+	// Add the Request ID to the response headers so the client can see it
+	w.Header().Set("X-Request-ID", reqID)
+
 	lb.lock.RLock()
 	limiterEnabled := lb.rl != nil
 	lb.lock.RUnlock()
+
 	if limiterEnabled {
-		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			slog.Warn("Failed to get client IP for rate limiting", "error", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
 		ipLimiter := lb.rl.GetLimiter(clientIP)
 		if !ipLimiter.Allow() {
-			slog.Warn("Rate limit exceeded", "client_ip", clientIP)
+			logger.Warn("Rate limit exceeded") // req_id and client_ip are automatically added
 			http.Error(w, "429 Too Many Requests", http.StatusTooManyRequests)
 			return
 		}
 	}
+
 	currentRoutes := lb.getRoutes()
 	for _, route := range currentRoutes {
 		if route.Matches(r) {
@@ -192,31 +267,8 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	slog.Warn("No route found for request", "host", r.Host, "path", r.URL.Path)
+	logger.Warn("No route found for request", "host", r.Host, "path", r.URL.Path)
 	http.NotFound(w, r)
-}
-func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
-	newRoutes := lb.buildRoutes(cfg)
-	var newRl *RateLimiter
-	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
-		newRl = NewRateLimiter(cfg.RateLimit)
-	}
-	var newCache *cache.Cache
-	if cfg.Cache != nil && cfg.Cache.Enabled {
-		newCache = cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
-		slog.Info("Cache enabled", "expiration", cfg.Cache.DefaultExpiration)
-	}
-	lb.cfg = cfg
-	lb.routes = newRoutes
-	lb.rl = newRl
-	lb.cache = newCache
-	slog.Info("Configuration successfully reloaded (unsafe)")
-}
-func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
-	lb.lock.Lock()
-	defer lb.lock.Unlock()
-	lb.reloadConfig_unsafe(cfg)
-	slog.Info("Configuration successfully reloaded (safe)")
 }
 
 // --- Admin API Helper Methods (NOW FIXED) ---
