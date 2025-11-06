@@ -14,6 +14,7 @@ type Config struct {
 	ListenAddr     string                `yaml:"listenAddr"`
 	MetricsAddr    string                `yaml:"metricsAddr"`
 	AdminAddr      string                `yaml:"adminAddr"`
+	AdminToken     string                `yaml:"adminToken"`
 	TLS            *TLSConfig            `yaml:"tls"`
 	Autocert       *AutocertConfig       `yaml:"autocert"`
 	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
