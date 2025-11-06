@@ -16,11 +16,12 @@ type Config struct {
 	TLS            *TLSConfig            `yaml:"tls"`
 	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
-	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"` // NEW
+	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
+	Cache          *CacheConfig          `yaml:"cache"` // NEW
 	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
-// ... (TLSConfig, RateLimitConfig, CircuitBreakerConfig - no changes) ...
+// ... (TLSConfig, RateLimitConfig, CircuitBreakerConfig, ConnectionPoolConfig - no changes) ...
 type TLSConfig struct {
 	CertFile string `yaml:"certFile"`
 	KeyFile  string `yaml:"keyFile"`
@@ -35,12 +36,17 @@ type CircuitBreakerConfig struct {
 	ConsecutiveFailures uint32        `yaml:"consecutiveFailures"`
 	OpenStateTimeout    time.Duration `yaml:"openStateTimeout"`
 }
-
-// NEW: ConnectionPoolConfig holds keep-alive settings
 type ConnectionPoolConfig struct {
 	MaxIdleConns        int           `yaml:"maxIdleConns"`
 	MaxIdleConnsPerHost int           `yaml:"maxIdleConnsPerHost"`
 	IdleConnTimeout     time.Duration `yaml:"idleConnTimeout"`
+}
+
+// NEW: CacheConfig holds cache settings
+type CacheConfig struct {
+	Enabled           bool          `yaml:"enabled"`
+	DefaultExpiration time.Duration `yaml:"defaultExpiration"`
+	CleanupInterval   time.Duration `yaml:"cleanupInterval"`
 }
 
 // ... (RouteConfig, BackendConfig, LoadConfig - no changes) ...

@@ -1,21 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-
-	// "net/http/httputil" // No longer needed here
-	// "net/url" // No longer needed here
 	"strings"
 	"sync"
 
+	"github.com/patrickmn/go-cache"
 	"github.com/sony/gobreaker"
 )
 
-// ... (Route struct - no changes) ...
+// ... (Route struct, Matches - no changes) ...
 type Route struct {
 	config  *RouteConfig
 	pool    *BackendPool
@@ -37,12 +36,18 @@ func (rt *Route) Matches(r *http.Request) bool {
 	return true
 }
 
-// ... (LoadBalancer struct - no changes) ...
+// ... (LoadBalancer struct, CacheItem, NewLoadBalancer - no changes) ...
 type LoadBalancer struct {
 	cfg    *Config
 	routes []*Route
 	rl     *RateLimiter
+	cache  *cache.Cache
 	lock   sync.RWMutex
+}
+type CacheItem struct {
+	Status int
+	Header http.Header
+	Body   []byte
 }
 
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
@@ -51,22 +56,47 @@ func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	return lb
 }
 
-// CHANGED: buildRoutes now passes connection pool config
+// buildRoutes - simplified handler logic
 func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 	routes := make([]*Route, 0, len(cfg.Routes))
 
 	for _, routeCfg := range cfg.Routes {
-		// NEW: Pass connection pool and circuit breaker configs
 		pool := NewBackendPool(
 			routeCfg.Strategy,
 			routeCfg.Backends,
 			cfg.CircuitBreaker,
-			cfg.ConnectionPool, // Pass the new config
+			cfg.ConnectionPool,
 		)
 		pool.StartHealthChecks()
 
 		// Create the reverse proxy handler for this pool
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// --- CACHE CHECK (STAGE 21) ---
+			lb.lock.RLock()
+			cacheEnabled := lb.cache != nil
+			lb.lock.RUnlock()
+			var cacheKey string
+
+			if cacheEnabled && r.Method == http.MethodGet {
+				cacheKey = r.Host + r.URL.Path
+				if item, found := lb.cache.Get(cacheKey); found {
+					log.Printf("Cache HIT for: %s", cacheKey)
+					cachedItem := item.(CacheItem)
+					for key, values := range cachedItem.Header {
+						for _, value := range values {
+							w.Header().Add(key, value)
+						}
+					}
+					w.WriteHeader(cachedItem.Status)
+					if _, err := w.Write(cachedItem.Body); err != nil {
+						log.Printf("Error writing cached response: %v", err)
+					}
+					return
+				}
+				log.Printf("Cache MISS for: %s", cacheKey)
+			}
+			// --- END CACHE CHECK ---
+
 			backend := pool.GetNextBackend(r)
 			if backend == nil {
 				log.Printf("No healthy, non-tripped backend found for: %s%s", r.Host, r.URL.Path)
@@ -75,8 +105,7 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 			}
 
 			// ... (Connection counting - no changes) ...
-			strategyNeedsConns := pool.strategy == "least-connections" ||
-				pool.strategy == "weighted-least-connections"
+			strategyNeedsConns := pool.strategy == "least-connections" || pool.strategy == "weighted-least-connections"
 			if strategyNeedsConns {
 				backend.IncrementConnections()
 				defer func() {
@@ -84,52 +113,66 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 				}()
 			}
 
-			// GONE: All proxy/URL creation logic is gone from here
+			// We need a recorder to capture status/body for CB and Caching
+			recorder := &CachingRecorder{
+				ResponseWriter: w,
+				Status:         http.StatusOK,
+				Body:           new(bytes.Buffer),
+			}
 
-			// --- Circuit Breaker Logic ---
+			// --- Circuit Breaker / Proxy Logic ---
+			var requestErr error
 			if backend.cb != nil {
-				_, err := backend.cb.Execute(func() (interface{}, error) {
+				_, requestErr = backend.cb.Execute(func() (interface{}, error) {
 					log.Printf("L7 Proxy: %s%s -> %s (CB: %s)", r.Host, r.URL.Path, backend.Addr, backend.cb.State())
-
-					recorder := &StatusRecorder{ResponseWriter: w, Status: http.StatusOK}
-
-					// NEW: Set the error handler *just before* the request
-					// This ensures the recorder is in scope
 					backend.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-						// This is a connection failure
-						// We can't write to 'w' here, as the recorder won't capture it.
-						// The error return will be handled by the circuit breaker logic.
 						log.Printf("Backend connection error for %s: %v", backend.Addr, err)
 					}
-
-					// Use the pre-built proxy
 					backend.proxy.ServeHTTP(recorder, r)
-
 					if recorder.Status >= http.StatusInternalServerError {
 						return nil, fmt.Errorf("backend %s returned status %d", backend.Addr, recorder.Status)
 					}
 					return nil, nil
 				})
+			} else {
+				// No circuit breaker, just proxy
+				log.Printf("L7 Proxy: %s%s -> %s", r.Host, r.URL.Path, backend.Addr)
+				backend.proxy.ServeHTTP(recorder, r)
+			}
 
-				if err != nil {
-					if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
-						log.Printf("Request blocked for %s (CB: %s)", backend.Addr, backend.cb.State())
-						http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
-					} else {
-						// Log the 5xx error or connection error
-						log.Printf("Failure recorded for %s: %v", backend.Addr, err)
-						// If the response wasn't already written (e.g., connection error),
-						// send a 502.
-						if w.Header().Get("Content-Type") == "" {
-							http.Error(w, "Bad Gateway", http.StatusBadGateway)
-						}
+			// --- Post-Request Processing ---
+			if requestErr != nil {
+				// Circuit breaker logic
+				if errors.Is(requestErr, gobreaker.ErrOpenState) || errors.Is(requestErr, gobreaker.ErrTooManyRequests) {
+					log.Printf("Request blocked for %s (CB: %s)", backend.Addr, requestErr)
+					http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
+				} else {
+					log.Printf("Failure recorded for %s: %v", backend.Addr, requestErr)
+					if !recorder.wroteHeader {
+						http.Error(w, "Bad Gateway", http.StatusBadGateway)
 					}
 				}
-			} else {
-				// No circuit breaker
-				log.Printf("L7 Proxy: %s%s -> %s", r.Host, r.URL.Path, backend.Addr)
-				// Use the pre-built proxy
-				backend.proxy.ServeHTTP(w, r)
+				return // Don't cache failures
+			}
+
+			// --- Caching Logic ---
+			// If we got here, request was successful. Check if we should cache.
+			if cacheEnabled && r.Method == http.MethodGet && recorder.Status < 500 {
+				item := CacheItem{
+					Status: recorder.Status,
+					Header: recorder.Header().Clone(), // Get headers from the recorder
+					Body:   recorder.Body.Bytes(),
+				}
+				log.Printf("Caching response for: %s (Size: %d bytes)", cacheKey, len(item.Body))
+				lb.cache.Set(cacheKey, item, cache.DefaultExpiration)
+			}
+
+			// If recorder didn't write, we must.
+			if !recorder.wroteHeader {
+				recorder.ResponseWriter.WriteHeader(recorder.Status)
+			}
+			if _, err := recorder.ResponseWriter.Write(recorder.Body.Bytes()); err != nil {
+				log.Printf("Error writing final response: %v", err)
 			}
 		})
 
@@ -183,11 +226,17 @@ func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
 		newRl = NewRateLimiter(cfg.RateLimit)
 	}
+	var newCache *cache.Cache
+	if cfg.Cache != nil && cfg.Cache.Enabled {
+		newCache = cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
+		log.Printf("Cache enabled with expiration %s", cfg.Cache.DefaultExpiration)
+	}
 
 	lb.lock.Lock()
 	lb.cfg = cfg
 	lb.routes = newRoutes
 	lb.rl = newRl
+	lb.cache = newCache
 	lb.lock.Unlock()
 
 	log.Println("Configuration successfully reloaded.")
