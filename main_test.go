@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/tls" // NEW
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -16,11 +16,10 @@ import (
 	"github.com/louisphilipmarcoux/go-load-balancer/backend"
 )
 
-// We now need 3 backends for testing
+// ... (Constants - no changes) ...
 const (
-	lbAddr      = "localhost:8443" // Test on the TLS port
-	metricsAddr = "localhost:9090"
-
+	lbAddr         = "localhost:8443"
+	metricsAddr    = "localhost:9090"
 	backendAddrAPI = "localhost:9091"
 	backendID_API  = "API-Server-1"
 	backendAddrMob = "localhost:9092"
@@ -29,10 +28,9 @@ const (
 	backendID_Web  = "Web-Server-1"
 )
 
-// Create a test http client that trusts our self-signed cert
 var testClient *http.Client
 
-// waitForPort waits for a port to become available
+// ... (waitForPort - no changes) ...
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -50,38 +48,38 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
-// TestMain now sets up the advanced routing test
+// CHANGED: TestMain now adds ConnectionPool config
 func TestMain(m *testing.M) {
-	// Start API server (for api.example.com)
+	// ... (Backend startup - no changes) ...
 	apiListener, err := backend.RunServer("9091", backendID_API)
 	if err != nil {
 		log.Fatalf("Failed to start API backend: %v", err)
 	}
 	defer func() { _ = apiListener.Close() }()
-
-	// Start Mobile server (for User-Agent: MobileApp)
 	mobListener, err := backend.RunServer("9092", backendID_Mob)
 	if err != nil {
 		log.Fatalf("Failed to start Mobile backend: %v", err)
 	}
 	defer func() { _ = mobListener.Close() }()
-
-	// Start Web server (default)
 	webListener, err := backend.RunServer("9093", backendID_Web)
 	if err != nil {
 		log.Fatalf("Failed to start Web backend: %v", err)
 	}
 	defer func() { _ = webListener.Close() }()
 
-	// Create a test config for L7 routing
 	cfg := &Config{
 		ListenAddr:  lbAddr,
 		MetricsAddr: metricsAddr,
-		TLS: &TLSConfig{ // Enable TLS for the test
+		TLS: &TLSConfig{
 			CertFile: "server.crt",
 			KeyFile:  "server.key",
 		},
-		// Note: No RateLimit or CircuitBreaker config for simplicity in tests
+		// NEW: Add a (small) connection pool for testing
+		ConnectionPool: &ConnectionPoolConfig{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     30 * time.Second,
+		},
 		Routes: []*RouteConfig{
 			{
 				Host:     "api.example.com",
@@ -103,12 +101,11 @@ func TestMain(m *testing.M) {
 		},
 	}
 
+	// ... (LB startup - no changes) ...
 	lb := NewLoadBalancer(cfg)
-	// Manually set health for test pools
 	lb.routes[0].pool.backends[0].SetHealth(true)
 	lb.routes[1].pool.backends[0].SetHealth(true)
 	lb.routes[2].pool.backends[0].SetHealth(true)
-
 	server := &http.Server{Addr: cfg.ListenAddr, Handler: lb}
 	go func() {
 		if err := server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -116,30 +113,24 @@ func TestMain(m *testing.M) {
 		}
 	}()
 	defer func() { _ = server.Shutdown(context.Background()) }()
-
 	go StartMetricsServer(cfg.MetricsAddr, lb)
-
-	// Wait for all servers
 	ports := []string{backendAddrAPI, backendAddrMob, backendAddrWeb, lbAddr, metricsAddr}
 	for _, port := range ports {
 		if err := waitForPort(port, 2*time.Second); err != nil {
 			log.Fatalf("Server on %s failed to start: %v", port, err)
 		}
 	}
-
-	// Create the test client
 	testClient = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // Trust self-signed cert
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
 
 	m.Run()
 }
 
-// TestL7Routing now tests Host and Header routing
+// ... (All other tests - TestL7Routing, TestBackendHealth, etc. - are UNCHANGED) ...
 func TestL7Routing(t *testing.T) {
-	// Test 1: Default request -> Web Server
 	reqWeb, _ := http.NewRequest("GET", "https://"+lbAddr+"/", nil)
 	respWeb, err := testClient.Do(reqWeb)
 	if err != nil {
@@ -150,10 +141,8 @@ func TestL7Routing(t *testing.T) {
 	if !strings.Contains(string(bodyWeb), backendID_Web) {
 		t.Errorf("Expected default request to hit %s, got %q", backendID_Web, string(bodyWeb))
 	}
-
-	// Test 2: Host header -> API Server
 	reqAPI, _ := http.NewRequest("GET", "https://"+lbAddr+"/users", nil)
-	reqAPI.Host = "api.example.com" // Set the Host
+	reqAPI.Host = "api.example.com"
 	respAPI, err := testClient.Do(reqAPI)
 	if err != nil {
 		t.Fatalf("Failed Host request: %v", err)
@@ -163,10 +152,8 @@ func TestL7Routing(t *testing.T) {
 	if !strings.Contains(string(bodyAPI), backendID_API) {
 		t.Errorf("Expected Host request to hit %s, got %q", backendID_API, string(bodyAPI))
 	}
-
-	// Test 3: Header -> Mobile Server
 	reqMob, _ := http.NewRequest("GET", "https://"+lbAddr+"/", nil)
-	reqMob.Header.Set("User-Agent", "MobileApp") // Set the Header
+	reqMob.Header.Set("User-Agent", "MobileApp")
 	respMob, err := testClient.Do(reqMob)
 	if err != nil {
 		t.Fatalf("Failed Header request: %v", err)
@@ -176,12 +163,9 @@ func TestL7Routing(t *testing.T) {
 	if !strings.Contains(string(bodyMob), backendID_Mob) {
 		t.Errorf("Expected Header request to hit %s, got %q", backendID_Mob, string(bodyMob))
 	}
-
-	// Test 4: Host header should take precedence over Header
-	// (Our routes are in order: Host, Header, Path. So Host will match first)
 	reqBoth, _ := http.NewRequest("GET", "https://"+lbAddr+"/", nil)
-	reqBoth.Host = "api.example.com"              // API Host
-	reqBoth.Header.Set("User-Agent", "MobileApp") // Mobile Header
+	reqBoth.Host = "api.example.com"
+	reqBoth.Header.Set("User-Agent", "MobileApp")
 	respBoth, err := testClient.Do(reqBoth)
 	if err != nil {
 		t.Fatalf("Failed precedence request: %v", err)
@@ -192,10 +176,6 @@ func TestL7Routing(t *testing.T) {
 		t.Errorf("Expected precedence request to hit API server %s, got %q", backendID_API, string(bodyBoth))
 	}
 }
-
-// --- Unit Tests (Unchanged) ---
-// These test the components in isolation
-
 func TestBackendHealth(t *testing.T) {
 	b := &Backend{}
 	if b.IsHealthy() {
@@ -210,7 +190,6 @@ func TestBackendHealth(t *testing.T) {
 		t.Error("Backend should be unhealthy after setting to false")
 	}
 }
-
 func TestGetNextBackendByLeastConns(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -227,7 +206,6 @@ func TestGetNextBackendByLeastConns(t *testing.T) {
 		t.Errorf("Expected backend server2, but got %s", be.Addr)
 	}
 }
-
 func TestGetNextBackendByIP(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -243,7 +221,6 @@ func TestGetNextBackendByIP(t *testing.T) {
 		t.Errorf("IP Hashing failed: same IP got different backends")
 	}
 }
-
 func TestGetNextBackendByRoundRobin(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -261,14 +238,11 @@ func TestGetNextBackendByRoundRobin(t *testing.T) {
 		}
 	}
 }
-
 func TestGetNextBackendByWeightedRoundRobin(t *testing.T) {
 	b1 := &Backend{Addr: "server1", Weight: 5}
 	b2 := &Backend{Addr: "server2", Weight: 1}
 	b3 := &Backend{Addr: "server3", Weight: 1}
-	pool := &BackendPool{
-		backends: []*Backend{b1, b2, b3},
-	}
+	pool := &BackendPool{backends: []*Backend{b1, b2, b3}}
 	b1.SetHealth(true)
 	b2.SetHealth(true)
 	b3.SetHealth(true)
@@ -285,14 +259,11 @@ func TestGetNextBackendByWeightedRoundRobin(t *testing.T) {
 		t.Errorf("Incorrect distribution: got %v", counts)
 	}
 }
-
 func TestGetNextBackendByWeightedLeastConns(t *testing.T) {
 	b1 := &Backend{Addr: "server1", Weight: 5}
 	b2 := &Backend{Addr: "server2", Weight: 1}
 	b3 := &Backend{Addr: "server3", Weight: 1}
-	pool := &BackendPool{
-		backends: []*Backend{b1, b2, b3},
-	}
+	pool := &BackendPool{backends: []*Backend{b1, b2, b3}}
 	b1.SetHealth(true)
 	b2.SetHealth(true)
 	b3.SetHealth(true)
@@ -310,24 +281,15 @@ func TestGetNextBackendByWeightedLeastConns(t *testing.T) {
 	b3.IncrementConnections()
 	be = pool.GetNextBackendByWeightedLeastConns()
 	if be.Addr != "server1" {
-		t.Errorf("Expected server1 (score 1.0), got %s (score %f)",
-			be.Addr, float64(be.GetConnections())/float64(be.Weight))
+		t.Errorf("Expected server1 (score 1.0), got %s (score %f)", be.Addr, float64(be.GetConnections())/float64(be.Weight))
 	}
 	b1.IncrementConnections()
 	be = pool.GetNextBackendByWeightedLeastConns()
 	if be.Addr != "server3" {
-		t.Errorf("Expected server3 (score 1.0), got %s (score %f)",
-			be.Addr, float64(be.GetConnections())/float64(be.Weight))
+		t.Errorf("Expected server3 (score 1.0), got %s (score %f)", be.Addr, float64(be.GetConnections())/float64(be.Weight))
 	}
 }
-
-// TestMetricsServer checks the metrics endpoint
-// This test is slightly less critical now, but still good to have.
-// It uses the config from TestMain.
-// TestMetricsServer checks the metrics endpoint
 func TestMetricsServer(t *testing.T) {
-	// CHANGED: Use a standard http.Get, not the testClient.
-	// The metrics server is on HTTP, not HTTPS.
 	resp, err := http.Get("http://" + metricsAddr + "/metrics")
 	if err != nil {
 		t.Fatalf("Failed to make request to metrics server: %v", err)
@@ -338,23 +300,16 @@ func TestMetricsServer(t *testing.T) {
 		t.Fatalf("Failed to read metrics response body: %v", err)
 	}
 	bodyStr := string(body)
-
-	// 3. Verify the response
 	expectedMetrics := []string{
 		"total_active_connections 0",
-		// API Server
 		fmt.Sprintf("backend_health_status{backend=\"%s\", route_path=\"/\", route_host=\"api.example.com\"} 1", backendAddrAPI),
 		fmt.Sprintf("backend_active_connections{backend=\"%s\", route_path=\"/\", route_host=\"api.example.com\"} 0", backendAddrAPI),
-		// Mobile Server
 		fmt.Sprintf("backend_health_status{backend=\"%s\", route_path=\"/\", route_host=\"\"} 1", backendAddrMob),
-		// Web Server
 		fmt.Sprintf("backend_health_status{backend=\"%s\", route_path=\"/\", route_host=\"\"} 1", backendAddrWeb),
 	}
-
 	for _, expected := range expectedMetrics {
 		if !strings.Contains(bodyStr, expected) {
-			t.Errorf("Metrics response missing expected line. Got:\n%s\nExpected to contain:\n%s",
-				bodyStr, expected)
+			t.Errorf("Metrics response missing expected line. Got:\n%s\nExpected to contain:\n%s", bodyStr, expected)
 		}
 	}
 }

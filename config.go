@@ -16,45 +16,46 @@ type Config struct {
 	TLS            *TLSConfig            `yaml:"tls"`
 	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
+	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"` // NEW
 	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
-// TLSConfig holds TLS certificate paths
+// ... (TLSConfig, RateLimitConfig, CircuitBreakerConfig - no changes) ...
 type TLSConfig struct {
 	CertFile string `yaml:"certFile"`
 	KeyFile  string `yaml:"keyFile"`
 }
-
-// RateLimitConfig holds rate limiter settings
 type RateLimitConfig struct {
 	Enabled           bool    `yaml:"enabled"`
 	RequestsPerSecond float64 `yaml:"requestsPerSecond"`
 	Burst             int     `yaml:"burst"`
 }
-
-// CircuitBreakerConfig holds circuit breaker settings
 type CircuitBreakerConfig struct {
 	Enabled             bool          `yaml:"enabled"`
 	ConsecutiveFailures uint32        `yaml:"consecutiveFailures"`
 	OpenStateTimeout    time.Duration `yaml:"openStateTimeout"`
 }
 
-// RouteConfig defines a single routing rule
+// NEW: ConnectionPoolConfig holds keep-alive settings
+type ConnectionPoolConfig struct {
+	MaxIdleConns        int           `yaml:"maxIdleConns"`
+	MaxIdleConnsPerHost int           `yaml:"maxIdleConnsPerHost"`
+	IdleConnTimeout     time.Duration `yaml:"idleConnTimeout"`
+}
+
+// ... (RouteConfig, BackendConfig, LoadConfig - no changes) ...
 type RouteConfig struct {
-	Host     string            `yaml:"host"`    // STAGE 19: Match by host header
-	Path     string            `yaml:"path"`    // Match by path prefix
-	Headers  map[string]string `yaml:"headers"` // STAGE 19: Match by headers
+	Host     string            `yaml:"host"`
+	Path     string            `yaml:"path"`
+	Headers  map[string]string `yaml:"headers"`
 	Strategy string            `yaml:"strategy"`
 	Backends []*BackendConfig  `yaml:"backends"`
 }
-
-// BackendConfig defines a single backend server
 type BackendConfig struct {
 	Addr   string `yaml:"addr"`
 	Weight int    `yaml:"weight"`
 }
 
-// LoadConfig reads and parses the configuration file
 func LoadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
