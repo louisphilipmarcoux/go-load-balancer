@@ -9,19 +9,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the top-level configuration
+// ... (Config, TLSConfig, RateLimitConfig, CircuitBreakerConfig, ConnectionPoolConfig, CacheConfig - no changes) ...
 type Config struct {
 	ListenAddr     string                `yaml:"listenAddr"`
 	MetricsAddr    string                `yaml:"metricsAddr"`
+	AdminAddr      string                `yaml:"adminAddr"`
 	TLS            *TLSConfig            `yaml:"tls"`
 	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
 	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
-	Cache          *CacheConfig          `yaml:"cache"` // NEW
+	Cache          *CacheConfig          `yaml:"cache"`
 	Routes         []*RouteConfig        `yaml:"routes"`
 }
-
-// ... (TLSConfig, RateLimitConfig, CircuitBreakerConfig, ConnectionPoolConfig - no changes) ...
 type TLSConfig struct {
 	CertFile string `yaml:"certFile"`
 	KeyFile  string `yaml:"keyFile"`
@@ -41,27 +40,32 @@ type ConnectionPoolConfig struct {
 	MaxIdleConnsPerHost int           `yaml:"maxIdleConnsPerHost"`
 	IdleConnTimeout     time.Duration `yaml:"idleConnTimeout"`
 }
-
-// NEW: CacheConfig holds cache settings
 type CacheConfig struct {
 	Enabled           bool          `yaml:"enabled"`
 	DefaultExpiration time.Duration `yaml:"defaultExpiration"`
 	CleanupInterval   time.Duration `yaml:"cleanupInterval"`
 }
 
-// ... (RouteConfig, BackendConfig, LoadConfig - no changes) ...
+// --- THIS BLOCK IS CHANGED ---
+
+// RouteConfig defines a single routing rule
 type RouteConfig struct {
-	Host     string            `yaml:"host"`
-	Path     string            `yaml:"path"`
-	Headers  map[string]string `yaml:"headers"`
-	Strategy string            `yaml:"strategy"`
-	Backends []*BackendConfig  `yaml:"backends"`
-}
-type BackendConfig struct {
-	Addr   string `yaml:"addr"`
-	Weight int    `yaml:"weight"`
+	Host     string            `yaml:"host"     json:"host,omitempty"`
+	Path     string            `yaml:"path"     json:"path"`
+	Headers  map[string]string `yaml:"headers"  json:"headers,omitempty"`
+	Strategy string            `yaml:"strategy" json:"strategy"`
+	Backends []*BackendConfig  `yaml:"backends" json:"backends"`
 }
 
+// BackendConfig defines a single backend server
+type BackendConfig struct {
+	Addr   string `yaml:"addr"   json:"addr"`
+	Weight int    `yaml:"weight" json:"weight"`
+}
+
+// --- END OF CHANGE ---
+
+// LoadConfig reads and parses the configuration file
 func LoadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
