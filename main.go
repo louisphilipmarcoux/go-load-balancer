@@ -2,36 +2,34 @@ package main
 
 import (
 	"errors"
-	"fmt" // NEW: Import fmt
+	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
 	"math"
 	"net"
-	"os" // NEW: Import os
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"gopkg.in/yaml.v3" // NEW: Import yaml
+	"gopkg.in/yaml.v3"
 )
 
-// --- NEW: Config Structs ---
-
-// Config struct to hold all our settings
+// --- Config Structs ---
 type Config struct {
 	ListenAddr string           `yaml:"listenAddr"`
 	Strategy   string           `yaml:"strategy"`
 	Backends   []*BackendConfig `yaml:"backends"`
 }
 
-// BackendConfig holds the config for a single backend
 type BackendConfig struct {
 	Addr string `yaml:"addr"`
-	// We'll add 'weight' here in a later stage
+	// NEW: Add Weight to the config
+	Weight int `yaml:"weight"`
 }
 
-// LoadConfig reads and parses the config.yaml file
+// ... LoadConfig (no changes) ...
 func LoadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -42,26 +40,26 @@ func LoadConfig(path string) (*Config, error) {
 			log.Printf("Warning: failed to close config file: %v", err)
 		}
 	}()
-
 	var cfg Config
 	decoder := yaml.NewDecoder(file)
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to decode config YAML: %w", err)
 	}
-
 	return &cfg, nil
 }
 
-// --- END: Config Structs ---
-
+// --- Backend Structs ---
 type Backend struct {
-	Addr        string
-	healthy     bool
-	lock        sync.RWMutex
-	connections uint64
+	Addr    string
+	healthy bool
+	lock    sync.RWMutex
+	// NEW: Add Weight and CurrentWeight
+	Weight        int
+	CurrentWeight int // Used by Weighted Round Robin
+	connections   uint64
 }
 
-// ... Backend methods (no changes) ...
+// ... IsHealthy, SetHealth, IncrementConnections, DecrementConnections, GetConnections (no changes) ...
 func (b *Backend) IsHealthy() bool {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
@@ -82,28 +80,35 @@ func (b *Backend) GetConnections() uint64 {
 	return atomic.LoadUint64(&b.connections)
 }
 
+// --- BackendPool ---
 type BackendPool struct {
 	backends []*Backend
-	// NEW: Store the selected strategy
 	strategy string
-	// NEW: We need this counter back for Round Robin
-	current uint64
+	current  uint64
+	// NEW: Add a lock for Weighted Round Robin
+	lock sync.Mutex
 }
 
-// NEW: NewBackendPool creates a pool from the config
+// CHANGED: NewBackendPool now handles weights
 func NewBackendPool(cfg *Config) *BackendPool {
 	backends := make([]*Backend, 0, len(cfg.Backends))
 	for _, bc := range cfg.Backends {
-		backends = append(backends, &Backend{Addr: bc.Addr})
+		weight := 1 // Default weight
+		if bc.Weight > 0 {
+			weight = bc.Weight
+		}
+		backends = append(backends, &Backend{
+			Addr:   bc.Addr,
+			Weight: weight,
+		})
 	}
-
 	return &BackendPool{
 		backends: backends,
 		strategy: cfg.Strategy,
 	}
 }
 
-// ... healthCheck (no changes) ...
+// ... healthCheck, StartHealthChecks (no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -124,7 +129,6 @@ func (p *BackendPool) healthCheck(b *Backend) {
 	}
 }
 
-// ... StartHealthChecks (no changes) ...
 func (p *BackendPool) StartHealthChecks() {
 	log.Println("Starting health checks...")
 	for _, b := range p.backends {
@@ -143,8 +147,7 @@ func (p *BackendPool) StartHealthChecks() {
 }
 
 // --- Strategy Implementations ---
-
-// GetNextBackendByIP implements IP Hashing
+// ... GetNextBackendByIP, GetNextBackendByLeastConns, GetNextBackendByRoundRobin (no changes) ...
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -161,7 +164,6 @@ func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	return healthyBackends[index]
 }
 
-// GetNextBackendByLeastConns implements Least Connections
 func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	var bestBackend *Backend
 	minConnections := uint64(math.MaxUint64)
@@ -178,44 +180,52 @@ func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	return bestBackend
 }
 
-// GetNextBackendByRoundRobin implements Round Robin
 func (p *BackendPool) GetNextBackendByRoundRobin() *Backend {
-	// We need a Read Lock here, not a full Lock,
-	// but let's add a sync.RWMutex to the pool first.
-	// For now, let's just use an atomic for the counter.
-	// We'll refactor the lock in a bit.
-
-	// Let's re-add the lock to the pool
-	// ... (see BackendPool struct)
-
-	// This function is complex with concurrent health checks.
-	// Let's simplify and add the lock back.
-
-	// --- REFECTORING BackendPool ---
-	// (See above) ... We'll add the lock back.
-	// And `current` is already there.
-
-	// This is a new refactor. We'll add a new lock
-	// to BackendPool, just for the counter.
-
-	// ... Let's make this simple.
-
 	numBackends := uint64(len(p.backends))
 	if numBackends == 0 {
 		return nil
 	}
-
-	// Loop to find a healthy one
 	for i := uint64(0); i < numBackends; i++ {
-		// We'll use atomic.AddUint64 to safely increment
 		index := atomic.AddUint64(&p.current, 1) % numBackends
-
 		backend := p.backends[index]
 		if backend.IsHealthy() {
 			return backend
 		}
 	}
 	return nil
+}
+
+// NEW: GetNextBackendByWeightedRoundRobin
+func (p *BackendPool) GetNextBackendByWeightedRoundRobin() *Backend {
+	// This lock is crucial for W-RR
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	var bestBackend *Backend
+	totalWeight := 0
+
+	for _, backend := range p.backends {
+		if !backend.IsHealthy() {
+			continue
+		}
+
+		// This is the core "Smooth Weighted Round Robin" logic
+		backend.CurrentWeight += backend.Weight
+		totalWeight += backend.Weight
+
+		if bestBackend == nil || backend.CurrentWeight > bestBackend.CurrentWeight {
+			bestBackend = backend
+		}
+	}
+
+	if bestBackend == nil {
+		return nil
+	}
+
+	// Adjust weights for the next round
+	bestBackend.CurrentWeight -= totalWeight
+
+	return bestBackend
 }
 
 // ... handleProxy (no changes) ...
@@ -249,7 +259,7 @@ func handleProxy(client, backend net.Conn) {
 	log.Printf("Connection for %s closed", client.RemoteAddr())
 }
 
-// CHANGED: Now accepts a *Config
+// CHANGED: Add new strategy to the switch
 func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -266,7 +276,6 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 	for {
 		client, err := listener.Accept()
 		if err != nil {
-			// ... (error handling, no changes) ...
 			if errors.Is(err, net.ErrClosed) {
 				log.Println("Listener closed.")
 				return nil
@@ -276,7 +285,6 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 		}
 
 		go func(c net.Conn) {
-			// --- NEW: STRATEGY ROUTING ---
 			var backend *Backend
 
 			switch pool.strategy {
@@ -294,14 +302,15 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 			case "least-connections":
 				backend = pool.GetNextBackendByLeastConns()
 
-			case "round-robin":
-				backend = pool.GetNextBackendByRoundRobin()
+			// NEW: Add the "weighted-round-robin" case
+			case "weighted-round-robin":
+				backend = pool.GetNextBackendByWeightedRoundRobin()
 
+			case "round-robin":
+				fallthrough // Use Round Robin as the default
 			default:
-				// Default to Round Robin
 				backend = pool.GetNextBackendByRoundRobin()
 			}
-			// --- END: STRATEGY ROUTING ---
 
 			if backend == nil {
 				log.Println("No available backends")
@@ -311,7 +320,6 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 				return
 			}
 
-			// For "least-connections", we must inc/dec the counter
 			if pool.strategy == "least-connections" {
 				backend.IncrementConnections()
 				defer backend.DecrementConnections()
@@ -324,7 +332,7 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 					log.Printf("Warning: failed to close client connection on backend dial error: %v", err)
 				}
 				if pool.strategy == "least-connections" {
-					backend.DecrementConnections() // Must decrement on dial error
+					backend.DecrementConnections()
 				}
 				return
 			}
@@ -334,21 +342,14 @@ func RunLoadBalancer(cfg *Config, pool *BackendPool) error {
 	}
 }
 
-// CHANGED: Load config and start
+// ... main (no changes) ...
 func main() {
-	// 1. Load configuration
 	cfg, err := LoadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
-
-	// 2. Create the backend pool from the config
 	pool := NewBackendPool(cfg)
-
-	// 3. Start health checks
 	pool.StartHealthChecks()
-
-	// 4. Run the load balancer
 	if err := RunLoadBalancer(cfg, pool); err != nil {
 		log.Fatalf("Failed to run load balancer: %v", err)
 	}
