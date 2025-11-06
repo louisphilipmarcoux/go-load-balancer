@@ -2,7 +2,7 @@ package main
 
 import (
 	"hash/fnv"
-	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -17,7 +17,7 @@ func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
 	case "ip-hash":
 		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
-			log.Printf("Failed to get client IP: %v, falling back to RoundRobin", err)
+			slog.Warn("Failed to get client IP for ip-hash", "error", err, "fallback", "round-robin")
 			return p.GetNextBackendByRoundRobin()
 		}
 		return p.GetNextBackendByIP(clientIP)

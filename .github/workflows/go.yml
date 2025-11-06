@@ -44,7 +44,7 @@ jobs:
       - name: Cache golangci-lint
         uses: actions/cache@v4
         with:
-          path: $(go env GOPATH)/bin/golangci-lint
+          path: ~/go/bin/golangci-lint
           # Re-cache only if go.mod changes
           key: ${{ runner.os }}-golangci-lint-${{ hashFiles('go.mod') }}
           restore-keys: |
@@ -52,7 +52,7 @@ jobs:
 
       - name: Run Linter
         run: |
-          $(go env GOPATH)/bin/golangci-lint run ./...
+          ~/go/bin/golangci-lint run ./...
 
       - name: Generate Test Certs
         run: |

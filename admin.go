@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv" // NEW
@@ -20,53 +20,41 @@ func adminAuthMiddleware(lb *LoadBalancer) mux.MiddlewareFunc {
 			expectedToken := lb.cfg.AdminToken
 			lb.lock.RUnlock()
 
-			// If no token is set in the config, allow the request
 			if expectedToken == "" {
-				log.Println("Admin auth is disabled (no adminToken in config)")
+				slog.Warn("Admin auth is disabled (no ADMIN_TOKEN in config)")
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Get the token from the "Authorization: Bearer <token>" header
 			authHeader := r.Header.Get("Authorization")
 			if authHeader == "" {
 				respondWithError(w, http.StatusUnauthorized, "Authorization header required")
 				return
 			}
-
 			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if token == authHeader { // No "Bearer " prefix
+			if token == authHeader {
 				respondWithError(w, http.StatusUnauthorized, "Invalid authorization format. Expected: Bearer <token>")
 				return
 			}
-
 			if token != expectedToken {
+				slog.Warn("Invalid admin token received", "remote_addr", r.RemoteAddr)
 				respondWithError(w, http.StatusUnauthorized, "Invalid token")
 				return
 			}
-
-			// Token is valid, proceed
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-// StartAdminServer starts the separate admin API server
 func StartAdminServer(lb *LoadBalancer) *http.Server {
 	if lb.cfg.AdminAddr == "" {
-		log.Println("Admin server is disabled (adminAddr not set)")
+		slog.Info("Admin server is disabled (adminAddr not set)")
 		return nil
 	}
-
 	r := mux.NewRouter()
 	api := r.PathPrefix("/api/v1").Subrouter()
-
-	// --- THIS IS THE KEY CHANGE ---
-	// Apply the auth middleware to all /api/v1 routes
 	api.Use(adminAuthMiddleware(lb))
-	// --- END OF CHANGE ---
 
-	// --- Define API Endpoints (Unchanged) ---
 	api.HandleFunc("/routes", getRoutesHandler(lb)).Methods("GET")
 	api.HandleFunc("/routes", addRouteHandler(lb)).Methods("POST")
 	api.HandleFunc("/routes/{index:[0-9]+}", getRouteHandler(lb)).Methods("GET")
@@ -81,35 +69,30 @@ func StartAdminServer(lb *LoadBalancer) *http.Server {
 	}
 
 	go func() {
-		log.Printf("Admin API server listening on %s", lb.cfg.AdminAddr)
+		slog.Info("Admin API server listening", "addr", lb.cfg.AdminAddr)
 		if err := adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("Admin server failed: %v", err)
+			slog.Error("Admin server failed", "error", err)
 		}
 	}()
-
 	return adminServer
 }
 
-// ... (respondWithError, respondWithJSON - no changes) ...
 func respondWithError(w http.ResponseWriter, code int, message string) {
 	respondWithJSON(w, code, map[string]string{"error": message})
 }
 
-// CHANGED: This function now pretty-prints JSON
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	// Use MarshalIndent for pretty-printing
 	response, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
-		log.Printf("Error marshaling JSON for admin response: %v", err)
+		slog.Error("Error marshaling JSON for admin response", "error", err)
 		http.Error(w, "Failed to marshal JSON response", http.StatusInternalServerError)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	response = append(response, '\n') // Add a newline for better `curl` output
+	response = append(response, '\n')
 	if _, err := w.Write(response); err != nil {
-		log.Printf("Error writing JSON response: %v", err)
+		slog.Warn("Error writing JSON response", "error", err)
 	}
 }
 

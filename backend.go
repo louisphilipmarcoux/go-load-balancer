@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"net"
 	"net/http"          // NEW
 	"net/http/httputil" // NEW
@@ -60,10 +60,9 @@ func NewBackendPool(
 	strategy string,
 	backendConfigs []*BackendConfig,
 	cbCfg *CircuitBreakerConfig,
-	poolCfg *ConnectionPoolConfig, // NEW
+	poolCfg *ConnectionPoolConfig,
 ) *BackendPool {
 
-	// NEW: Create one shared transport for this entire pool
 	var transport *http.Transport
 	if poolCfg != nil {
 		transport = &http.Transport{
@@ -72,19 +71,15 @@ func NewBackendPool(
 			IdleConnTimeout:     poolCfg.IdleConnTimeout,
 		}
 	} else {
-		// Use default transport if no config
 		transport = &http.Transport{}
 	}
 
 	backends := make([]*Backend, 0, len(backendConfigs))
 	for _, bc := range backendConfigs {
-		// ... (Weight logic - no change) ...
 		weight := 1
 		if bc.Weight > 0 {
 			weight = bc.Weight
 		}
-
-		// ... (Circuit breaker logic - no change) ...
 		var cb *gobreaker.CircuitBreaker
 		if cbCfg != nil && cbCfg.Enabled {
 			st := gobreaker.Settings{
@@ -94,32 +89,27 @@ func NewBackendPool(
 				},
 				Timeout: cbCfg.OpenStateTimeout,
 				OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-					log.Printf("CircuitBreaker '%s' state changed: %s -> %s", name, from, to)
+					slog.Warn("CircuitBreaker state changed", "backend", name, "from", from.String(), "to", to.String())
 				},
 			}
 			cb = gobreaker.NewCircuitBreaker(st)
 		}
 
-		// NEW: Parse URL and create the proxy ONCE
 		parsedURL, err := url.Parse("http://" + bc.Addr)
 		if err != nil {
-			log.Printf("Failed to parse backend URL %s: %v", bc.Addr, err)
-			continue // Skip this backend
+			slog.Error("Failed to parse backend URL", "url", bc.Addr, "error", err)
+			continue
 		}
 
-		// Create the proxy, but we'll customize it
 		proxy := httputil.NewSingleHostReverseProxy(parsedURL)
-		// Set the shared transport
 		proxy.Transport = transport
-		// We'll set the ErrorHandler in the handler logic to use the
-		// circuit breaker's status recorder.
 
 		backends = append(backends, &Backend{
 			Addr:      bc.Addr,
 			Weight:    weight,
 			cb:        cb,
-			parsedURL: parsedURL, // Store it
-			proxy:     proxy,     // Store it
+			parsedURL: parsedURL,
+			proxy:     proxy,
 		})
 	}
 	return &BackendPool{
@@ -128,28 +118,28 @@ func NewBackendPool(
 	}
 }
 
-// ... (healthCheck, StartHealthChecks, GetTotalConnections - no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
 		if b.IsHealthy() {
-			log.Printf("Backend %s is DOWN", b.Addr)
+			slog.Warn("Backend health check failed", "backend", b.Addr, "status", "DOWN", "error", err)
 			b.SetHealth(false)
 		}
 		return
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
-			log.Printf("Warning: failed to close health check connection: %v", err)
+			slog.Warn("Failed to close health check connection", "backend", b.Addr, "error", err)
 		}
 	}()
 	if !b.IsHealthy() {
-		log.Printf("Backend %s is UP", b.Addr)
+		slog.Info("Backend health check successful", "backend", b.Addr, "status", "UP")
 		b.SetHealth(true)
 	}
 }
+
 func (p *BackendPool) StartHealthChecks() {
-	log.Printf("Starting health checks for %d backends...", len(p.backends))
+	slog.Info("Starting health checks", "backend_count", len(p.backends))
 	for _, b := range p.backends {
 		go p.healthCheck(b)
 	}
@@ -157,10 +147,10 @@ func (p *BackendPool) StartHealthChecks() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			log.Println("Running scheduled health checks...")
+			slog.Debug("Running scheduled health checks...")
 			for _, b := range p.backends {
 				if b.cb != nil && b.cb.State() == gobreaker.StateOpen {
-					log.Printf("Skipping health check for %s (circuit OPEN)", b.Addr)
+					slog.Debug("Skipping health check for open circuit", "backend", b.Addr)
 					continue
 				}
 				go p.healthCheck(b)

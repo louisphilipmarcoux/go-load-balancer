@@ -13,6 +13,7 @@ require (
 )
 
 require (
+	github.com/caarlos0/env/v9 v9.0.0
 	golang.org/x/net v0.45.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 )
