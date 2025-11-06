@@ -1,11 +1,19 @@
 listenAddr: ":8080"
-strategy: "weighted-least-connections"
-# NEW: Add an address for the metrics server
 metricsAddr: ":9090"
-backends:
-  - addr: "localhost:9001"
-    weight: 5
-  - addr: "localhost:9002"
-    weight: 1
-  - addr: "localhost:9003"
-    weight: 1
+
+routes:
+  # Route for API servers
+  - path: "/api/" # Note the trailing slash for prefix matching
+    strategy: "round-robin"
+    backends:
+      - addr: "localhost:9001"
+        weight: 1
+
+  # Default/Web route
+  - path: "/" # This will catch everything else
+    strategy: "weighted-least-connections"
+    backends:
+      - addr: "localhost:9002"
+        weight: 5
+      - addr: "localhost:9003"
+        weight: 1
