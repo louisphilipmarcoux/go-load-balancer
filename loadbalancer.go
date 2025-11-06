@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
+	"net/http" // NEW
 	"strings"
 	"sync"
 
@@ -14,7 +14,7 @@ import (
 	"github.com/sony/gobreaker"
 )
 
-// ... (Route struct, Matches - no changes) ...
+// ... (Route struct, Matches, LoadBalancer struct, CacheItem, NewLoadBalancer - no changes) ...
 type Route struct {
 	config  *RouteConfig
 	pool    *BackendPool
@@ -36,7 +36,6 @@ func (rt *Route) Matches(r *http.Request) bool {
 	return true
 }
 
-// ... (LoadBalancer struct, CacheItem, NewLoadBalancer - no changes) ...
 type LoadBalancer struct {
 	cfg    *Config
 	routes []*Route
@@ -52,14 +51,13 @@ type CacheItem struct {
 
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
-	lb.ReloadConfig(cfg)
+	lb.ReloadConfig(cfg) // Calls the safe, locking version
 	return lb
 }
 
-// buildRoutes - simplified handler logic
+// ... (buildRoutes - no changes) ...
 func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 	routes := make([]*Route, 0, len(cfg.Routes))
-
 	for _, routeCfg := range cfg.Routes {
 		pool := NewBackendPool(
 			routeCfg.Strategy,
@@ -68,15 +66,11 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 			cfg.ConnectionPool,
 		)
 		pool.StartHealthChecks()
-
-		// Create the reverse proxy handler for this pool
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// --- CACHE CHECK (STAGE 21) ---
 			lb.lock.RLock()
 			cacheEnabled := lb.cache != nil
 			lb.lock.RUnlock()
 			var cacheKey string
-
 			if cacheEnabled && r.Method == http.MethodGet {
 				cacheKey = r.Host + r.URL.Path
 				if item, found := lb.cache.Get(cacheKey); found {
@@ -95,16 +89,12 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 				}
 				log.Printf("Cache MISS for: %s", cacheKey)
 			}
-			// --- END CACHE CHECK ---
-
 			backend := pool.GetNextBackend(r)
 			if backend == nil {
 				log.Printf("No healthy, non-tripped backend found for: %s%s", r.Host, r.URL.Path)
 				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 				return
 			}
-
-			// ... (Connection counting - no changes) ...
 			strategyNeedsConns := pool.strategy == "least-connections" || pool.strategy == "weighted-least-connections"
 			if strategyNeedsConns {
 				backend.IncrementConnections()
@@ -112,15 +102,11 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 					backend.DecrementConnections()
 				}()
 			}
-
-			// We need a recorder to capture status/body for CB and Caching
 			recorder := &CachingRecorder{
 				ResponseWriter: w,
 				Status:         http.StatusOK,
 				Body:           new(bytes.Buffer),
 			}
-
-			// --- Circuit Breaker / Proxy Logic ---
 			var requestErr error
 			if backend.cb != nil {
 				_, requestErr = backend.cb.Execute(func() (interface{}, error) {
@@ -135,14 +121,10 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 					return nil, nil
 				})
 			} else {
-				// No circuit breaker, just proxy
 				log.Printf("L7 Proxy: %s%s -> %s", r.Host, r.URL.Path, backend.Addr)
 				backend.proxy.ServeHTTP(recorder, r)
 			}
-
-			// --- Post-Request Processing ---
 			if requestErr != nil {
-				// Circuit breaker logic
 				if errors.Is(requestErr, gobreaker.ErrOpenState) || errors.Is(requestErr, gobreaker.ErrTooManyRequests) {
 					log.Printf("Request blocked for %s (CB: %s)", backend.Addr, requestErr)
 					http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
@@ -152,22 +134,17 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 						http.Error(w, "Bad Gateway", http.StatusBadGateway)
 					}
 				}
-				return // Don't cache failures
+				return
 			}
-
-			// --- Caching Logic ---
-			// If we got here, request was successful. Check if we should cache.
 			if cacheEnabled && r.Method == http.MethodGet && recorder.Status < 500 {
 				item := CacheItem{
 					Status: recorder.Status,
-					Header: recorder.Header().Clone(), // Get headers from the recorder
+					Header: recorder.Header().Clone(),
 					Body:   recorder.Body.Bytes(),
 				}
 				log.Printf("Caching response for: %s (Size: %d bytes)", cacheKey, len(item.Body))
 				lb.cache.Set(cacheKey, item, cache.DefaultExpiration)
 			}
-
-			// If recorder didn't write, we must.
 			if !recorder.wroteHeader {
 				recorder.ResponseWriter.WriteHeader(recorder.Status)
 			}
@@ -175,7 +152,6 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 				log.Printf("Error writing final response: %v", err)
 			}
 		})
-
 		routes = append(routes, &Route{
 			config:  routeCfg,
 			pool:    pool,
@@ -185,7 +161,7 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 	return routes
 }
 
-// ... (getRoutes, ServeHTTP, ReloadConfig - no changes) ...
+// ... (getRoutes, ServeHTTP - no changes) ...
 func (lb *LoadBalancer) getRoutes() []*Route {
 	lb.lock.RLock()
 	defer lb.lock.RUnlock()
@@ -195,7 +171,6 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.lock.RLock()
 	limiterEnabled := lb.rl != nil
 	lb.lock.RUnlock()
-
 	if limiterEnabled {
 		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
@@ -220,7 +195,11 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("No route found for: %s%s", r.Host, r.URL.Path)
 	http.NotFound(w, r)
 }
-func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
+
+// --- THIS IS THE DEADLOCK FIX ---
+
+// reloadConfig_unsafe atomically swaps the config without locking.
+func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
 	newRoutes := lb.buildRoutes(cfg)
 	var newRl *RateLimiter
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
@@ -232,12 +211,141 @@ func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 		log.Printf("Cache enabled with expiration %s", cfg.Cache.DefaultExpiration)
 	}
 
-	lb.lock.Lock()
+	// We are already inside a lock, so we just set the fields
 	lb.cfg = cfg
 	lb.routes = newRoutes
 	lb.rl = newRl
 	lb.cache = newCache
-	lb.lock.Unlock()
 
-	log.Println("Configuration successfully reloaded.")
+	log.Println("Configuration successfully reloaded (unsafe).")
+}
+
+// ReloadConfig is the public, thread-safe method for reloading.
+func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+	lb.reloadConfig_unsafe(cfg)
+	log.Println("Configuration successfully reloaded (safe).")
+}
+
+// --- Admin API Helper Methods (NOW FIXED) ---
+
+// getRouteByIndex finds a route by its index in the config
+func (lb *LoadBalancer) getRouteByIndex(index int) (*RouteConfig, error) {
+	if index < 0 || index >= len(lb.cfg.Routes) {
+		return nil, fmt.Errorf("route index %d out of bounds", index)
+	}
+	return lb.cfg.Routes[index], nil
+}
+
+// AddRoute adds a new route to the config and reloads
+func (lb *LoadBalancer) AddRoute(newRoute *RouteConfig) error {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	for _, route := range lb.cfg.Routes {
+		if route.Path == newRoute.Path && route.Host == newRoute.Host {
+			return fmt.Errorf("route with path '%s' and host '%s' already exists", newRoute.Path, newRoute.Host)
+		}
+	}
+	lb.cfg.Routes = append(lb.cfg.Routes, newRoute)
+
+	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	return nil
+}
+
+// DeleteRoute removes a route from the config and reloads
+func (lb *LoadBalancer) DeleteRoute(index int) error {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	if _, err := lb.getRouteByIndex(index); err != nil {
+		return err
+	}
+
+	// Remove element at index
+	lb.cfg.Routes = append(lb.cfg.Routes[:index], lb.cfg.Routes[index+1:]...)
+
+	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	return nil
+}
+
+// AddBackendToRoute adds a backend to a specific route and reloads
+func (lb *LoadBalancer) AddBackendToRoute(index int, newBackend *BackendConfig) error {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	route, err := lb.getRouteByIndex(index)
+	if err != nil {
+		return err
+	}
+
+	for _, be := range route.Backends {
+		if be.Addr == newBackend.Addr {
+			return fmt.Errorf("backend '%s' already exists in route %d", newBackend.Addr, index)
+		}
+	}
+	if newBackend.Weight == 0 {
+		newBackend.Weight = 1
+	}
+	route.Backends = append(route.Backends, newBackend)
+
+	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	return nil
+}
+
+// DeleteBackendFromRoute removes a backend from a specific route and reloads
+func (lb *LoadBalancer) DeleteBackendFromRoute(index int, host string) error {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	route, err := lb.getRouteByIndex(index)
+	if err != nil {
+		return err
+	}
+
+	found := false
+	newBackends := make([]*BackendConfig, 0)
+	for _, be := range route.Backends {
+		if be.Addr == host {
+			found = true
+			continue
+		}
+		newBackends = append(newBackends, be)
+	}
+	if !found {
+		return fmt.Errorf("backend '%s' not found in route %d", host, index)
+	}
+	route.Backends = newBackends
+
+	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	return nil
+}
+
+// UpdateBackendWeightInRoute updates a backend's weight in a route and reloads
+func (lb *LoadBalancer) UpdateBackendWeightInRoute(index int, host string, weight int) error {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	route, err := lb.getRouteByIndex(index)
+	if err != nil {
+		return err
+	}
+	if weight <= 0 {
+		return fmt.Errorf("weight must be > 0")
+	}
+	found := false
+	for _, be := range route.Backends {
+		if be.Addr == host {
+			be.Weight = weight
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("backend '%s' not found in route %d", host, index)
+	}
+
+	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	return nil
 }

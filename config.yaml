@@ -1,5 +1,6 @@
 listenAddr: ":8443"
 metricsAddr: ":9090"
+adminAddr: ":9091"
 
 tls:
   certFile: "server.crt"
@@ -38,6 +39,7 @@ routes:
     strategy: "round-robin"
     backends:
       - addr: "localhost:9001"
+        weight: 1
 
   - path: "/"
     headers:
@@ -45,6 +47,7 @@ routes:
     strategy: "round-robin"
     backends:
       - addr: "localhost:9002"
+        weight: 1
 
   # ---
   # THIS MUST BE THE LAST ROUTE
@@ -53,3 +56,4 @@ routes:
     strategy: "weighted-least-connections"
     backends:
       - addr: "localhost:9003"
+        weight: 1
