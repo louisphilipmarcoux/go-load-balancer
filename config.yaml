@@ -1,20 +1,22 @@
-listenAddr: ":8443" # <-- CHANGED to a common HTTPS test port
+listenAddr: ":8443"
 metricsAddr: ":9090"
 
-# NEW: Add a TLS block
 tls:
   certFile: "server.crt"
   keyFile: "server.key"
 
+# NEW: Add rate limiting config
+rateLimit:
+  enabled: true
+  requestsPerSecond: 10 # 10 tokens added per second
+  burst: 20 # Bucket size of 20
+
 routes:
-  # Route for API servers
   - path: "/api/"
     strategy: "round-robin"
     backends:
       - addr: "localhost:9001"
         weight: 1
-
-  # Default/Web route
   - path: "/"
     strategy: "weighted-least-connections"
     backends:

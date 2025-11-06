@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-
-	// "io" // No longer needed
 	"log"
 	"math"
 	"net"
@@ -20,22 +18,29 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/time/rate" // NEW
 	"gopkg.in/yaml.v3"
 )
 
 // --- Config Structs ---
-// CHANGED: Added TLS
 type Config struct {
-	ListenAddr  string         `yaml:"listenAddr"`
-	MetricsAddr string         `yaml:"metricsAddr"`
-	TLS         *TLSConfig     `yaml:"tls"` // NEW
-	Routes      []*RouteConfig `yaml:"routes"`
+	ListenAddr  string           `yaml:"listenAddr"`
+	MetricsAddr string           `yaml:"metricsAddr"`
+	TLS         *TLSConfig       `yaml:"tls"`
+	RateLimit   *RateLimitConfig `yaml:"rateLimit"` // NEW
+	Routes      []*RouteConfig   `yaml:"routes"`
 }
 
-// NEW: TLSConfig struct
 type TLSConfig struct {
 	CertFile string `yaml:"certFile"`
 	KeyFile  string `yaml:"keyFile"`
+}
+
+// NEW: RateLimitConfig struct
+type RateLimitConfig struct {
+	Enabled           bool    `yaml:"enabled"`
+	RequestsPerSecond float64 `yaml:"requestsPerSecond"`
+	Burst             int     `yaml:"burst"`
 }
 
 // ... (RouteConfig, BackendConfig, LoadConfig - no changes) ...
@@ -100,7 +105,7 @@ func (b *Backend) GetConnections() uint64 {
 }
 
 // --- BackendPool ---
-// ... (NewBackendPool, healthCheck, StartHealthChecks, GetTotalConnections - no changes) ...
+// ... (No changes to BackendPool or its methods) ...
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -169,7 +174,7 @@ func (p *BackendPool) GetTotalConnections() uint64 {
 }
 
 // --- Strategy Implementations ---
-// ... (GetNextBackend, GetNextBackendByIP, ...etc - no changes) ...
+// ... (No changes to strategy functions) ...
 func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
 	switch p.strategy {
 	case "ip-hash":
@@ -274,15 +279,47 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	return bestBackend
 }
 
+// --- NEW: Rate Limiter ---
+type RateLimiter struct {
+	clients map[string]*rate.Limiter
+	lock    sync.Mutex
+	rlCfg   *RateLimitConfig
+}
+
+// NewRateLimiter creates our IP-based rate limiter
+func NewRateLimiter(rlCfg *RateLimitConfig) *RateLimiter {
+	return &RateLimiter{
+		clients: make(map[string]*rate.Limiter),
+		rlCfg:   rlCfg,
+	}
+}
+
+// GetLimiter retrieves the limiter for a given IP, creating one if it doesn't exist.
+func (rl *RateLimiter) GetLimiter(ip string) *rate.Limiter {
+	rl.lock.Lock()
+	defer rl.lock.Unlock()
+
+	// Check if a limiter already exists for this IP
+	limiter, exists := rl.clients[ip]
+	if !exists {
+		// Create a new limiter if it doesn't
+		limiter = rate.NewLimiter(rate.Limit(rl.rlCfg.RequestsPerSecond), rl.rlCfg.Burst)
+		rl.clients[ip] = limiter
+	}
+	return limiter
+}
+
 // --- Proxy and LB ---
-// ... (LoadBalancer struct, buildState, NewLoadBalancer, ServeHTTP, ReloadConfig - no changes) ...
+// CHANGED: LoadBalancer now holds a RateLimiter
 type LoadBalancer struct {
 	cfg   *Config
 	mux   *http.ServeMux
-	pools map[string]*BackendPool // map[path] -> *BackendPool
+	pools map[string]*BackendPool
+	rl    *RateLimiter // NEW
 	lock  sync.RWMutex
 }
 
+// ... (buildState - no changes) ...
 func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*BackendPool) {
 	mux := http.NewServeMux()
 	pools := make(map[string]*BackendPool)
@@ -334,19 +371,52 @@ func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*Bac
 	return mux, pools
 }
 
+// CHANGED: NewLoadBalancer now initializes the RateLimiter
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{cfg: cfg}
 	lb.mux, lb.pools = lb.buildState(cfg)
+	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
+		lb.rl = NewRateLimiter(cfg.RateLimit)
+	}
 	return lb
 }
 
+// CHANGED: ServeHTTP now checks the rate limiter first
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// --- RATE LIMITING LOGIC ---
+	lb.lock.RLock()
+	limiterEnabled := lb.rl != nil
+	lb.lock.RUnlock()
+
+	if limiterEnabled {
+		// Get the client's IP
+		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			log.Printf("Failed to get client IP for rate limiting: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		// Get the limiter for this IP
+		ipLimiter := lb.rl.GetLimiter(clientIP)
+
+		// Check if the request is allowed
+		if !ipLimiter.Allow() {
+			log.Printf("Rate limit exceeded for IP: %s", clientIP)
+			http.Error(w, "429 Too Many Requests", http.StatusTooManyRequests)
+			return // Stop processing the request
+		}
+	}
+	// --- END RATE LIMITING LOGIC ---
+
+	// If allowed, proceed to routing
 	lb.lock.RLock()
 	mux := lb.mux
 	lb.lock.RUnlock()
 	mux.ServeHTTP(w, r)
 }
 
+// CHANGED: ReloadConfig now rebuilds the rate limiter
 func (lb *LoadBalancer) ReloadConfig(path string) error {
 	log.Println("Reloading configuration from", path)
 	cfg, err := LoadConfig(path)
@@ -355,11 +425,16 @@ func (lb *LoadBalancer) ReloadConfig(path string) error {
 	}
 
 	newMux, newPools := lb.buildState(cfg)
+	var newRl *RateLimiter
+	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
+		newRl = NewRateLimiter(cfg.RateLimit)
+	}
 
 	lb.lock.Lock()
 	lb.cfg = cfg
 	lb.mux = newMux
 	lb.pools = newPools
+	lb.rl = newRl // Atomically swap the rate limiter
 	lb.lock.Unlock()
 
 	log.Println("Configuration successfully reloaded.")
@@ -405,7 +480,7 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 	}
 }
 
-// CHANGED: main now checks for TLS config
+// ... (main - no changes) ...
 func main() {
 	configPath := "config.yaml"
 	cfg, err := LoadConfig(configPath)
