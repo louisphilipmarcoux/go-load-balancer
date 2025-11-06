@@ -11,14 +11,14 @@ import (
 
 // Config is the top-level configuration
 type Config struct {
-	ListenAddr     string               `yaml:"listenAddr"`
-	MetricsAddr    string               `yaml:"metricsAddr"`
-	TLS            *TLSConfig           `yaml:"tls"`
-	RateLimit      *RateLimitConfig     `yaml:"rateLimit"`
+	ListenAddr     string                `yaml:"listenAddr"`
+	MetricsAddr    string                `yaml:"metricsAddr"`
+	TLS            *TLSConfig            `yaml:"tls"`
+	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
 	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
-	Cache          *CacheConfig         `yaml:"cache"` // NEW
-	Routes         []*RouteConfig       `yaml:"routes"`
+	Cache          *CacheConfig          `yaml:"cache"` // NEW
+	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
 // ... (TLSConfig, RateLimitConfig, CircuitBreakerConfig, ConnectionPoolConfig - no changes) ...
@@ -61,14 +61,21 @@ type BackendConfig struct {
 	Addr   string `yaml:"addr"`
 	Weight int    `yaml:"weight"`
 }
+
 func LoadConfig(path string) (*Config, error) {
 	file, err := os.Open(path)
-	if err != nil { return nil, fmt.Errorf("failed to open config file: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("failed to open config file: %w", err)
+	}
 	defer func() {
-		if err := file.Close(); err != nil { log.Printf("Warning: failed to close config file: %v", err) }
+		if err := file.Close(); err != nil {
+			log.Printf("Warning: failed to close config file: %v", err)
+		}
 	}()
 	var cfg Config
 	decoder := yaml.NewDecoder(file)
-	if err := decoder.Decode(&cfg); err != nil { return nil, fmt.Errorf("failed to decode config YAML: %w", err) }
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to decode config YAML: %w", err)
+	}
 	return &cfg, nil
 }
