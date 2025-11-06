@@ -26,8 +26,10 @@ type Config struct {
 }
 
 type TLSConfig struct {
-	CertFile string `yaml:"certFile" env:"TLS_CERT_FILE"`
-	KeyFile  string `yaml:"keyFile"  env:"TLS_KEY_FILE"`
+	CertFile     string   `yaml:"certFile" env:"TLS_CERT_FILE"`
+	KeyFile      string   `yaml:"keyFile"  env:"TLS_KEY_FILE"`
+	MinVersion   string   `yaml:"minVersion"   env:"TLS_MIN_VERSION"`
+	CipherSuites []string `yaml:"cipherSuites" env:"TLS_CIPHER_SUITES" envSeparator:","`
 }
 
 type AutocertConfig struct {
