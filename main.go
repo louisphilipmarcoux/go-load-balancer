@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context" // NEW
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
+
+	// "io" // No longer needed
 	"log"
 	"math"
 	"net"
 	"net/http"
+	"net/http/httputil" // NEW
+	"net/url"           // NEW
 	"os"
 	"os/signal"
 	"sync"
@@ -20,19 +24,27 @@ import (
 )
 
 // --- Config Structs ---
-// ... (No changes) ...
+// CHANGED: Config now holds routes
 type Config struct {
-	ListenAddr  string           `yaml:"listenAddr"`
-	Strategy    string           `yaml:"strategy"`
-	MetricsAddr string           `yaml:"metricsAddr"`
-	Backends    []*BackendConfig `yaml:"backends"`
+	ListenAddr  string         `yaml:"listenAddr"`
+	MetricsAddr string         `yaml:"metricsAddr"`
+	Routes      []*RouteConfig `yaml:"routes"`
 }
+
+// NEW: RouteConfig defines a path and its associated pool
+type RouteConfig struct {
+	Path     string           `yaml:"path"`
+	Strategy string           `yaml:"strategy"`
+	Backends []*BackendConfig `yaml:"backends"`
+}
+
 type BackendConfig struct {
 	Addr   string `yaml:"addr"`
 	Weight int    `yaml:"weight"`
 }
 
 func LoadConfig(path string) (*Config, error) {
+	// ... (No changes to this function) ...
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open config file: %w", err)
@@ -51,7 +63,7 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 // --- Backend Structs ---
-// ... (No changes) ...
+// ... (No changes to Backend struct or its methods) ...
 type Backend struct {
 	Addr          string
 	healthy       bool
@@ -82,7 +94,6 @@ func (b *Backend) GetConnections() uint64 {
 }
 
 // --- BackendPool ---
-// ... (No changes) ...
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -90,9 +101,10 @@ type BackendPool struct {
 	lock     sync.Mutex
 }
 
-func NewBackendPool(cfg *Config) *BackendPool {
-	backends := make([]*Backend, 0, len(cfg.Backends))
-	for _, bc := range cfg.Backends {
+// CHANGED: NewBackendPool now takes strategy and backend configs directly
+func NewBackendPool(strategy string, backendConfigs []*BackendConfig) *BackendPool {
+	backends := make([]*Backend, 0, len(backendConfigs))
+	for _, bc := range backendConfigs {
 		weight := 1
 		if bc.Weight > 0 {
 			weight = bc.Weight
@@ -104,9 +116,11 @@ func NewBackendPool(cfg *Config) *BackendPool {
 	}
 	return &BackendPool{
 		backends: backends,
-		strategy: cfg.Strategy,
+		strategy: strategy,
 	}
 }
+
+// ... (healthCheck, StartHealthChecks, GetTotalConnections - no changes) ...
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -127,7 +141,7 @@ func (p *BackendPool) healthCheck(b *Backend) {
 	}
 }
 func (p *BackendPool) StartHealthChecks() {
-	log.Println("Starting health checks...")
+	log.Printf("Starting health checks for %d backends...", len(p.backends))
 	for _, b := range p.backends {
 		go p.healthCheck(b)
 	}
@@ -151,7 +165,31 @@ func (p *BackendPool) GetTotalConnections() uint64 {
 }
 
 // --- Strategy Implementations ---
-// ... (No changes) ...
+
+// NEW: GetNextBackend wraps all strategies and accepts *http.Request
+func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
+	switch p.strategy {
+	case "ip-hash":
+		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			log.Printf("Failed to get client IP: %v, falling back to RoundRobin", err)
+			return p.GetNextBackendByRoundRobin()
+		}
+		return p.GetNextBackendByIP(clientIP)
+	case "least-connections":
+		return p.GetNextBackendByLeastConns()
+	case "weighted-least-connections":
+		return p.GetNextBackendByWeightedLeastConns()
+	case "weighted-round-robin":
+		return p.GetNextBackendByWeightedRoundRobin()
+	case "round-robin":
+		fallthrough
+	default:
+		return p.GetNextBackendByRoundRobin()
+	}
+}
+
+// ... (GetNextBackendByIP, LeastConns, RoundRobin, etc. - no changes) ...
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -235,66 +273,86 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	return bestBackend
 }
 
-// --- Proxy ---
-// ... (handleProxy - no changes) ...
-func handleProxy(client, backend net.Conn) {
-	defer func() {
-		if err := client.Close(); err != nil {
-			log.Printf("Warning: failed to close client connection: %v", err)
-		}
-	}()
-	defer func() {
-		if err := backend.Close(); err != nil {
-			log.Printf("Warning: failed to close backend connection: %v", err)
-		}
-	}()
-	log.Printf("Proxying traffic for %s to %s", client.RemoteAddr(), backend.RemoteAddr())
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(backend, client); err != nil {
-			log.Printf("Error copying from client to backend: %v", err)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(client, backend); err != nil {
-			log.Printf("Error copying from backend to client: %v", err)
-		}
-	}()
-	wg.Wait()
-	log.Printf("Connection for %s closed", client.RemoteAddr())
-}
+// --- Proxy and LB ---
+// GONE: handleProxy (TCP copy) is no longer needed
 
-// --- NEW: LoadBalancer Struct ---
-// LoadBalancer holds the state that needs to be hot-swappable
+// CHANGED: LoadBalancer now holds the router and pools
 type LoadBalancer struct {
-	cfg      *Config
-	pool     *BackendPool
-	lock     sync.RWMutex
-	listener net.Listener
-	wg       sync.WaitGroup
+	cfg   *Config
+	mux   *http.ServeMux
+	pools map[string]*BackendPool // map[path] -> *BackendPool
+	lock  sync.RWMutex
 }
 
-// NewLoadBalancer creates a new LoadBalancer instance
-func NewLoadBalancer(cfg *Config, listener net.Listener) *LoadBalancer {
-	pool := NewBackendPool(cfg)
-	return &LoadBalancer{
-		cfg:      cfg,
-		pool:     pool,
-		listener: listener,
+// NEW: buildState creates the router and pools from config
+func (lb *LoadBalancer) buildState(cfg *Config) (*http.ServeMux, map[string]*BackendPool) {
+	mux := http.NewServeMux()
+	pools := make(map[string]*BackendPool)
+
+	for _, route := range cfg.Routes {
+		// Capture loop variables for the closure
+		route := route
+		pool := NewBackendPool(route.Strategy, route.Backends)
+		pool.StartHealthChecks()
+		pools[route.Path] = pool
+
+		// Create the HTTP handler for this route
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			backend := pool.GetNextBackend(r)
+			if backend == nil {
+				log.Printf("No healthy backend found for path: %s", route.Path)
+				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+				return
+			}
+
+			// Increment/Decrement connections if needed
+			strategyNeedsConns := pool.strategy == "least-connections" ||
+				pool.strategy == "weighted-least-connections"
+			if strategyNeedsConns {
+				backend.IncrementConnections()
+				// Use defer in a closure to ensure it runs *after* proxy.ServeHTTP
+				defer func() {
+					backend.DecrementConnections()
+				}()
+			}
+
+			// Create the reverse proxy
+			targetUrl, err := url.Parse("http://" + backend.Addr)
+			if err != nil {
+				log.Printf("Failed to parse backend URL: %v", err)
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+			proxy := httputil.NewSingleHostReverseProxy(targetUrl)
+
+			// Log the L7 proxy action
+			log.Printf("L7 Proxy: %s %s -> %s", r.Method, r.URL.Path, backend.Addr)
+
+			// proxy.ServeHTTP handles the request
+			proxy.ServeHTTP(w, r)
+		})
+		mux.Handle(route.Path, handler)
 	}
+	return mux, pools
 }
 
-// GetPool atomically retrieves the current backend pool
-func (lb *LoadBalancer) GetPool() *BackendPool {
+// CHANGED: NewLoadBalancer uses buildState
+func NewLoadBalancer(cfg *Config) *LoadBalancer {
+	lb := &LoadBalancer{cfg: cfg}
+	lb.mux, lb.pools = lb.buildState(cfg)
+	return lb
+}
+
+// NEW: ServeHTTP makes LoadBalancer an http.Handler
+// It safely gets the current mux and serves the request
+func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.lock.RLock()
-	defer lb.lock.RUnlock()
-	return lb.pool
+	mux := lb.mux
+	lb.lock.RUnlock()
+	mux.ServeHTTP(w, r)
 }
 
-// ReloadConfig loads a new config file and atomically swaps the backend pool
+// CHANGED: ReloadConfig now rebuilds the mux and pools
 func (lb *LoadBalancer) ReloadConfig(path string) error {
 	log.Println("Reloading configuration from", path)
 	cfg, err := LoadConfig(path)
@@ -302,113 +360,46 @@ func (lb *LoadBalancer) ReloadConfig(path string) error {
 		return fmt.Errorf("failed to load new config: %w", err)
 	}
 
-	newPool := NewBackendPool(cfg)
-	newPool.StartHealthChecks() // Start health checks for the new pool
+	newMux, newPools := lb.buildState(cfg)
 
 	lb.lock.Lock()
 	lb.cfg = cfg
-	lb.pool = newPool
+	lb.mux = newMux
+	lb.pools = newPools
 	lb.lock.Unlock()
 
 	log.Println("Configuration successfully reloaded.")
 	return nil
 }
 
-// --- CHANGED: RunLoadBalancer is now a method on LoadBalancer ---
-func (lb *LoadBalancer) Run() error {
-	log.Printf("Load Balancer listening on %s, strategy: %s", lb.listener.Addr().String(), lb.cfg.Strategy)
-	for {
-		client, err := lb.listener.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				log.Println("Listener closed. No longer accepting new connections.")
-				return nil
-			}
-			log.Printf("Failed to accept connection: %v", err)
-			continue
-		}
+// GONE: RunLoadBalancer (TCP accept loop) is no longer needed
 
-		lb.wg.Add(1)
-		go func(c net.Conn) {
-			defer lb.wg.Done()
-
-			// Get the *current* pool for this connection
-			pool := lb.GetPool()
-
-			var backend *Backend
-			strategyNeedsConns := pool.strategy == "least-connections" ||
-				pool.strategy == "weighted-least-connections"
-			switch pool.strategy {
-			case "ip-hash":
-				clientIP, _, err := net.SplitHostPort(c.RemoteAddr().String())
-				if err != nil {
-					log.Printf("Failed to get client IP: %v", err)
-					if err := c.Close(); err != nil {
-						log.Printf("Warning: failed to close client connection on IP error: %v", err)
-					}
-					return
-				}
-				backend = pool.GetNextBackendByIP(clientIP)
-			case "least-connections":
-				backend = pool.GetNextBackendByLeastConns()
-			case "weighted-least-connections":
-				backend = pool.GetNextBackendByWeightedLeastConns()
-			case "weighted-round-robin":
-				backend = pool.GetNextBackendByWeightedRoundRobin()
-			case "round-robin":
-				fallthrough
-			default:
-				backend = pool.GetNextBackendByRoundRobin()
-			}
-			if backend == nil {
-				log.Println("No available backends")
-				if err := c.Close(); err != nil {
-					log.Printf("Warning: failed to close client connection on no backend error: %v", err)
-				}
-				return
-			}
-			if strategyNeedsConns {
-				backend.IncrementConnections()
-				defer backend.DecrementConnections()
-			}
-			backendConn, err := net.DialTimeout("tcp", backend.Addr, 3*time.Second)
-			if err != nil {
-				log.Printf("Failed to connect to backend: %s", backend.Addr)
-				if err := c.Close(); err != nil {
-					log.Printf("Warning: failed to close client connection on backend dial error: %v", err)
-				}
-				if strategyNeedsConns {
-					backend.DecrementConnections()
-				}
-				return
-			}
-			handleProxy(c, backendConn)
-		}(client)
-	}
-}
-
-// --- CHANGED: StartMetricsServer now accepts *LoadBalancer ---
+// CHANGED: StartMetricsServer now reads from multiple pools
 func StartMetricsServer(addr string, lb *LoadBalancer) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		// Get the *current* pool for this metrics scrape
-		pool := lb.GetPool()
+		lb.lock.RLock()
+		pools := lb.pools // Get the current map of pools
+		lb.lock.RUnlock()
+
 		var body string
+		var totalConns uint64
 
-		// 1. Total active connections
-		totalConns := pool.GetTotalConnections()
-		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
-
-		// 2. Per-backend stats
-		for _, b := range pool.backends {
-			health := 0
-			if b.IsHealthy() {
-				health = 1
+		// Loop over each route and its pool
+		for path, pool := range pools {
+			totalConns += pool.GetTotalConnections()
+			for _, b := range pool.backends {
+				health := 0
+				if b.IsHealthy() {
+					health = 1
+				}
+				// Add a "route" label to distinguish backends
+				body += fmt.Sprintf("backend_health_status{backend=\"%s\", route=\"%s\"} %d\n", b.Addr, path, health)
+				conns := b.GetConnections()
+				body += fmt.Sprintf("backend_active_connections{backend=\"%s\", route=\"%s\"} %d\n", b.Addr, path, conns)
 			}
-			body += fmt.Sprintf("backend_health_status{backend=\"%s\"} %d\n", b.Addr, health)
-			conns := b.GetConnections()
-			body += fmt.Sprintf("backend_active_connections{backend=\"%s\"} %d\n", b.Addr, conns)
 		}
+		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
 
 		w.Header().Set("Content-Type", "text/plain")
 		if _, err := w.Write([]byte(body)); err != nil {
@@ -422,7 +413,7 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 	}
 }
 
-// --- CHANGED: main now uses LoadBalancer and handles SIGHUP ---
+// CHANGED: main now uses http.Server and Shutdown()
 func main() {
 	configPath := "config.yaml"
 	cfg, err := LoadConfig(configPath)
@@ -430,30 +421,30 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		log.Fatalf("Failed to create listener: %v", err)
+	// Create the central LoadBalancer (which is an http.Handler)
+	lb := NewLoadBalancer(cfg)
+
+	// Create the main HTTP server
+	server := &http.Server{
+		Addr:    cfg.ListenAddr,
+		Handler: lb,
 	}
 
-	// Create the central LoadBalancer
-	lb := NewLoadBalancer(cfg, listener)
-	lb.pool.StartHealthChecks() // Start initial health checks
-
-	// Start the metrics server
+	// Start the metrics server in a goroutine
 	if cfg.MetricsAddr != "" {
 		go StartMetricsServer(cfg.MetricsAddr, lb)
 	}
 
-	// Start the main load balancer run loop
+	// Start the main load balancer server in a goroutine
 	go func() {
-		if err := lb.Run(); err != nil {
+		log.Printf("Load Balancer (L7) listening on %s", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("Failed to run load balancer: %v", err)
 		}
 	}()
 
 	// --- Signal handling for shutdown AND reload ---
 	sigChan := make(chan os.Signal, 1)
-	// Listen for INT, TERM (shutdown) and HUP (reload)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
 	for sig := range sigChan {
@@ -461,20 +452,16 @@ func main() {
 		case syscall.SIGINT, syscall.SIGTERM:
 			// --- Graceful Shutdown ---
 			log.Println("Shutting down... Stopping new connections.")
-			if err := lb.listener.Close(); err != nil {
-				log.Printf("Warning: failed to close listener: %v", err)
-			}
-			log.Println("Waiting for all active connections to finish...")
-			done := make(chan struct{})
-			go func() {
-				lb.wg.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
+
+			// Create a context for shutdown
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			// Shutdown the server
+			if err := server.Shutdown(ctx); err != nil {
+				log.Printf("Graceful shutdown failed: %v", err)
+			} else {
 				log.Println("Graceful shutdown complete.")
-			case <-time.After(30 * time.Second):
-				log.Println("Shutdown timeout. Forcing exit.")
 			}
 			return // Exit main
 

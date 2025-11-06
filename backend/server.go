@@ -12,13 +12,16 @@ import (
 func RunServer(port, serverID string) (net.Listener, error) {
 	log.Printf("Starting backend server %s on port %s\n", serverID, port)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// NEW: Define the handler logic
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Server %s] Received request from %s", serverID, r.RemoteAddr)
 		// Check the error return value.
 		if _, err := fmt.Fprintf(w, "Hello from backend server: %s\n", serverID); err != nil {
 			log.Printf("Warning: failed to write response: %v", err)
 		}
 	})
+
+	// GONE: http.HandleFunc("/", ...) - We no longer use the global mux
 
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
@@ -27,7 +30,8 @@ func RunServer(port, serverID string) (net.Listener, error) {
 
 	// Start serving in a goroutine so this function can return
 	go func() {
-		err := http.Serve(listener, nil)
+		// CHANGED: Pass our specific handler, not 'nil' (which uses the global mux)
+		err := http.Serve(listener, handler)
 
 		// We expect a net.ErrClosed when the listener is closed,
 		// We check for it and exit gracefully instead of calling log.Fatalf.
