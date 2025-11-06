@@ -15,15 +15,26 @@ type Config struct {
 	MetricsAddr    string                `yaml:"metricsAddr"`
 	AdminAddr      string                `yaml:"adminAddr"`
 	TLS            *TLSConfig            `yaml:"tls"`
+	Autocert       *AutocertConfig       `yaml:"autocert"`
 	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
 	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
 	Cache          *CacheConfig          `yaml:"cache"`
 	Routes         []*RouteConfig        `yaml:"routes"`
 }
+
+// ADD THIS STRUCT BACK
 type TLSConfig struct {
 	CertFile string `yaml:"certFile"`
 	KeyFile  string `yaml:"keyFile"`
+}
+
+// NEW: AutocertConfig holds settings for Let's Encrypt
+type AutocertConfig struct {
+	Enabled  bool     `yaml:"enabled"`
+	Email    string   `yaml:"email"`
+	Domains  []string `yaml:"domains"`
+	CacheDir string   `yaml:"cacheDir"`
 }
 type RateLimitConfig struct {
 	Enabled           bool    `yaml:"enabled"`
