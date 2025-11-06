@@ -27,7 +27,12 @@ func TestAdminAuthMiddleware(t *testing.T) {
 
 	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		// FIX: Check the error returned by w.Write()
+		if _, err := w.Write([]byte("OK")); err != nil {
+			// In a test handler, you might log or ignore, but the linter is satisfied.
+			// Since this is a test, we simply return without further error handling.
+			return
+		}
 	})
 
 	authMiddleware := adminAuthMiddleware(lb)
