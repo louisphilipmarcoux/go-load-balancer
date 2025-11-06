@@ -62,7 +62,7 @@ func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
 	newRoutes := lb.buildRoutes(cfg)
 	var newRl *RateLimiter
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
-		newRl = NewRateLimiter(cfg.RateLimit)
+		newRl = NewRateLimiter(cfg)
 	}
 	var newCache *cache.Cache
 	if cfg.Cache != nil && cfg.Cache.Enabled {
@@ -87,7 +87,29 @@ func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
-	lb.ReloadConfig(cfg) // Calls the safe, locking version
+
+	// --- THIS IS THE CHANGE ---
+	// Create the rate limiter
+	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
+		lb.rl = NewRateLimiter(cfg) // NewRateLimiter now takes the whole config
+		if lb.rl == nil {
+			slog.Warn("Rate limiter initialization failed, disabling.")
+		}
+	}
+	// Create the cache
+	if cfg.Cache != nil && cfg.Cache.Enabled {
+		lb.cache = cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
+		slog.Info("Cache enabled", "expiration", cfg.Cache.DefaultExpiration)
+	}
+
+	// Build routes (this is now done *after* creating dependencies)
+	lb.routes = lb.buildRoutes(cfg)
+	lb.cfg = cfg // Set the config
+
+	// lb.ReloadConfig(cfg) // We no longer need to call this
+	// --- END CHANGE ---
+
+	slog.Info("Load balancer initialized")
 	return lb
 }
 
@@ -252,9 +274,12 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.lock.RUnlock()
 
 	if limiterEnabled {
-		ipLimiter := lb.rl.GetLimiter(clientIP)
-		if !ipLimiter.Allow() {
-			logger.Warn("Rate limit exceeded") // req_id and client_ip are automatically added
+		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+		// --- THIS IS THE CHANGE ---
+		// We no longer get a "limiter" object, we just ask to "Allow"
+		if !lb.rl.Allow(clientIP) {
+			logger.Warn("Global rate limit exceeded")
 			http.Error(w, "429 Too Many Requests", http.StatusTooManyRequests)
 			return
 		}

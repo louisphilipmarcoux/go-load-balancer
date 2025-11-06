@@ -10,6 +10,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type RedisConfig struct {
+	Addr     string `env:"REDIS_ADDR"`
+	Password string `env:"REDIS_PASSWORD"`
+	DB       int    `env:"REDIS_DB"`
+}
+
 // Config is the top-level configuration
 type Config struct {
 	ListenAddr     string                `yaml:"listenAddr"     env:"LISTEN_ADDR"`
@@ -22,6 +28,7 @@ type Config struct {
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
 	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
 	Cache          *CacheConfig          `yaml:"cache"`
+	Redis          *RedisConfig          `yaml:"redis"`
 	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
@@ -92,6 +99,12 @@ func LoadConfig(path string) (*Config, error) {
 	decoder := yaml.NewDecoder(file)
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to decode config YAML: %w", err)
+	}
+
+	// Manually initialize the RedisConfig struct if it's nil.
+	// This allows env.Parse to populate it even if it's not in the YAML.
+	if cfg.Redis == nil {
+		cfg.Redis = &RedisConfig{}
 	}
 
 	// 2. NEW: Override with environment variables
