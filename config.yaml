@@ -1,6 +1,9 @@
 listenAddr: ":8080"
-strategy: "ip-hash" # Change this to "round-robin" or "least-connections" to test!
+strategy: "weighted-round-robin" # Set this to test
 backends:
   - addr: "localhost:9001"
+    weight: 5 # This server gets 5x the traffic
   - addr: "localhost:9002"
+    weight: 1
   - addr: "localhost:9003"
+    weight: 1

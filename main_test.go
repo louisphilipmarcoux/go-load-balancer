@@ -20,13 +20,13 @@ const (
 	backendID   = "Test-Server-1"
 )
 
-// ... waitForPort (no changes) ...
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("port %s never became available", addr)
 		}
+
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil && conn != nil {
 			if err := conn.Close(); err != nil {
@@ -34,11 +34,11 @@ func waitForPort(addr string, timeout time.Duration) error {
 			}
 			return nil
 		}
+
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-// CHANGED: Update TestMain to use Config
 func TestMain(m *testing.M) {
 	backendListener, err := backend.RunServer("9001", backendID)
 	if err != nil {
@@ -50,25 +50,20 @@ func TestMain(m *testing.M) {
 		}
 	}()
 
-	// 1. Create a test config
 	cfg := &Config{
 		ListenAddr: ":8080",
-		Strategy:   "round-robin", // We use a simple strategy for the basic test
-		Backends:   []*BackendConfig{{Addr: backendAddr}},
+		Strategy:   "round-robin",
+		Backends:   []*BackendConfig{{Addr: backendAddr, Weight: 1}},
 	}
-
-	// 2. Create the pool
 	testPool := NewBackendPool(cfg)
-	testPool.backends[0].SetHealth(true) // Manually set healthy for the test
+	testPool.backends[0].SetHealth(true)
 
-	// 3. Run the load balancer
 	go func() {
 		if err := RunLoadBalancer(cfg, testPool); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("LB exited: %v", err)
 		}
 	}()
 
-	// 4. Wait for servers
 	if err := waitForPort(backendAddr, 2*time.Second); err != nil {
 		log.Fatalf("Backend server failed to start: %v", err)
 	}
@@ -79,7 +74,6 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// ... TestProxyRequest, TestHandleProxy_Unit, TestBackendHealth (no changes) ...
 func TestProxyRequest(t *testing.T) {
 	resp, err := http.Get("http://" + lbAddr)
 	if err != nil {
@@ -99,6 +93,7 @@ func TestProxyRequest(t *testing.T) {
 		t.Errorf("Unexpected response body. Got %q, expected to contain %q", string(body), expectedResponse)
 	}
 }
+
 func TestHandleProxy_Unit(t *testing.T) {
 	clientConn, clientPipe := net.Pipe()
 	backendConn, backendPipe := net.Pipe()
@@ -135,6 +130,7 @@ func TestHandleProxy_Unit(t *testing.T) {
 		t.Logf("Warning: failed to close client pipe: %v", err)
 	}
 }
+
 func TestBackendHealth(t *testing.T) {
 	b := &Backend{}
 	if b.IsHealthy() {
@@ -150,7 +146,6 @@ func TestBackendHealth(t *testing.T) {
 	}
 }
 
-// RENAMED: TestLeastConnections to test the *specific* algorithm
 func TestGetNextBackendByLeastConns(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -162,15 +157,12 @@ func TestGetNextBackendByLeastConns(t *testing.T) {
 	b3.SetHealth(true)
 	b3.IncrementConnections()
 	pool := &BackendPool{backends: []*Backend{b1, b2, b3}}
-
 	be := pool.GetNextBackendByLeastConns()
 	if be.Addr != "server2" {
 		t.Errorf("Expected backend server2, but got %s", be.Addr)
 	}
-	// ... (rest of test is fine)
 }
 
-// RENAMED: TestIPHashing to test the *specific* algorithm
 func TestGetNextBackendByIP(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
@@ -179,36 +171,61 @@ func TestGetNextBackendByIP(t *testing.T) {
 	b1.SetHealth(true)
 	b2.SetHealth(true)
 	b3.SetHealth(true)
-
-	// ... (rest of test is fine, but call GetNextBackendByIP)
 	ip1 := "192.168.1.1"
 	be1 := pool.GetNextBackendByIP(ip1)
-	be3 := pool.GetNextBackendByIP(ip1) // Same IP
+	be3 := pool.GetNextBackendByIP(ip1)
 	if be1.Addr != be3.Addr {
 		t.Errorf("IP Hashing failed: same IP got different backends")
 	}
 }
 
-// NEW: Test for our Round Robin function
 func TestGetNextBackendByRoundRobin(t *testing.T) {
 	b1 := &Backend{Addr: "server1"}
 	b2 := &Backend{Addr: "server2"}
 	b3 := &Backend{Addr: "server3"}
 	pool := &BackendPool{backends: []*Backend{b1, b2, b3}}
 	b1.SetHealth(true)
-	b2.SetHealth(false) // b2 is unhealthy
+	b2.SetHealth(false)
 	b3.SetHealth(true)
-
-	// Expected sequence: b3, b1, b3, b1 (skips b2)
+	pool.current = 1
 	expectedAddrs := []string{"server3", "server1", "server3", "server1"}
-
-	// We need to set the first index
-	pool.current = 1 // Next call will be 2
-
 	for _, expected := range expectedAddrs {
 		backend := pool.GetNextBackendByRoundRobin()
 		if backend.Addr != expected {
 			t.Errorf("Expected backend %s, but got %s", expected, backend.Addr)
 		}
+	}
+}
+
+// Test for Weighted Round Robin
+// Test for Weighted Round Robin
+func TestGetNextBackendByWeightedRoundRobin(t *testing.T) {
+	// 1. Setup pool with weights 5, 1, 1
+	b1 := &Backend{Addr: "server1", Weight: 5}
+	b2 := &Backend{Addr: "server2", Weight: 1}
+	b3 := &Backend{Addr: "server3", Weight: 1}
+	pool := &BackendPool{
+		backends: []*Backend{b1, b2, b3},
+	}
+	b1.SetHealth(true)
+	b2.SetHealth(true)
+	b3.SetHealth(true)
+
+	// 2. Expected distribution over 7 requests (5+1+1)
+	// This is the correct trace of the algorithm.
+	expectedAddrs := []string{"server1", "server1", "server2", "server1", "server3", "server1", "server1"}
+
+	counts := make(map[string]int)
+	for _, expected := range expectedAddrs {
+		backend := pool.GetNextBackendByWeightedRoundRobin()
+		if backend.Addr != expected {
+			// This line is line 232 in your file
+			t.Errorf("Expected backend %s, but got %s", expected, backend.Addr)
+		}
+		counts[backend.Addr]++
+	}
+
+	if counts["server1"] != 5 || counts["server2"] != 1 || counts["server3"] != 1 {
+		t.Errorf("Incorrect distribution: got %v", counts)
 	}
 }
