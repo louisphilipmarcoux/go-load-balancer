@@ -94,10 +94,20 @@ func StartAdminServer(lb *LoadBalancer) *http.Server {
 func respondWithError(w http.ResponseWriter, code int, message string) {
 	respondWithJSON(w, code, map[string]string{"error": message})
 }
+
+// CHANGED: This function now pretty-prints JSON
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	response, _ := json.Marshal(payload)
+	// Use MarshalIndent for pretty-printing
+	response, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		log.Printf("Error marshaling JSON for admin response: %v", err)
+		http.Error(w, "Failed to marshal JSON response", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	response = append(response, '\n') // Add a newline for better `curl` output
 	if _, err := w.Write(response); err != nil {
 		log.Printf("Error writing JSON response: %v", err)
 	}
