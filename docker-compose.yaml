@@ -31,12 +31,21 @@ services:
       - REDIS_ADDR=redis:6379 # <-- ADD THIS
       - REDIS_PASSWORD=        # <-- ADD THIS (empty for local)
       - REDIS_DB=0
+      - CONSUL_ADDR=consul:8500
     depends_on:
-      - backend1
-      - backend2
-      - backend3
-      - redis
-    
+      backend1:
+        condition: service_started
+      backend2:
+        condition: service_started
+      backend3:
+        condition: service_started
+      redis:
+        condition: service_started
+      consul:
+        condition: service_healthy
+      registrator:
+        condition: service_started
+
   # -------------------
   # Backend Servers
   # -------------------
@@ -44,26 +53,32 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    container_name: backend-1
     # This command starts the backend with a specific port and ID
     # This port is INSIDE docker
     command: ["-port", "9001", "Server-1"]
     # No 'ports' needed; the 'lb' service can reach it
     # by its Docker service name ('backend1:9001')
+    labels:
+      - SERVICE_NAME=api-service
+      - SERVICE_TAGS=api,backend
 
   backend2:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    container_name: backend-2
     command: ["-port", "9002", "Server-2"]
+    labels:
+      - SERVICE_NAME=mobile-service
+      - SERVICE_TAGS=mobile,backend
 
   backend3:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    container_name: backend-3
     command: ["-port", "9003", "Server-3"]
+    labels:
+      - SERVICE_NAME=web-service
+      - SERVICE_TAGS=web,backend
 
   # -------------------
   # NEW: Redis Service
@@ -74,6 +89,31 @@ services:
     ports:
       - "6379:6379" # Expose for local debugging if you want
     command: redis-server --save 60 1 --loglevel warning
+
+  consul:
+    image: "hashicorp/consul:1.18"
+    container_name: consul
+    ports:
+      - "8500:8500"
+    command: "agent -dev -client=0.0.0.0 -ui -node=consul-dev"
+    # NEW: This healthcheck tells other containers when Consul is ready
+    healthcheck:
+      test: ["CMD", "consul", "info"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  registrator:
+    image: "frjaraur/registrator:latest"
+    container_name: registrator
+    depends_on:
+      consul:
+        # Wait for the healthcheck to pass before starting
+        condition: service_healthy
+    volumes:
+      - "/var/run/docker.sock:/tmp/docker.sock"
+    # NEW: This is the corrected command
+    command: ["registrator", "-internal", "consul://consul:8500"]
 
 # Define the persistent volume for the cert cache
 volumes:

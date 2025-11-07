@@ -46,6 +46,7 @@ func (rt *Route) Matches(r *http.Request) bool {
 
 type LoadBalancer struct {
 	cfg    *Config
+	consul *ConsulClient
 	routes []*Route
 	rl     *RateLimiter
 	cache  *cache.Cache
@@ -59,6 +60,19 @@ type CacheItem struct {
 }
 
 func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
+	// Re-create consul client on reload (in case addr changed)
+	if cfg.Consul != nil && cfg.Consul.Addr != "" {
+		consulClient, err := NewConsulClient(cfg.Consul.Addr)
+		if err != nil {
+			slog.Error("Failed to re-initialize Consul client", "error", err)
+			lb.consul = nil
+		} else {
+			lb.consul = consulClient
+		}
+	} else {
+		lb.consul = nil
+	}
+
 	newRoutes := lb.buildRoutes(cfg)
 	var newRl *RateLimiter
 	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
@@ -87,6 +101,17 @@ func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
+
+	// Create the Consul client *first*
+	if cfg.Consul != nil && cfg.Consul.Addr != "" {
+		consulClient, err := NewConsulClient(cfg.Consul.Addr)
+		if err != nil {
+			slog.Error("Failed to initialize Consul client, service discovery will fail", "error", err)
+		} else {
+			// Only assign the client on success
+			lb.consul = consulClient
+		}
+	}
 
 	// --- THIS IS THE CHANGE ---
 	// Create the rate limiter
@@ -118,8 +143,8 @@ func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
 	routes := make([]*Route, 0, len(cfg.Routes))
 	for _, routeCfg := range cfg.Routes {
 		pool := NewBackendPool(
-			routeCfg.Strategy,
-			routeCfg.Backends,
+			routeCfg,
+			lb.consul, // <-- PASS THE CONSUL CLIENT
 			cfg.CircuitBreaker,
 			cfg.ConnectionPool,
 		)
