@@ -55,13 +55,108 @@ type BackendPool struct {
 	lock     sync.Mutex
 }
 
+// newBackend constructs a single Backend.
+// We pass cbCfg and poolCfg so we can re-use them.
+func (p *BackendPool) newBackend(
+	beConfig *BackendConfig,
+	cbCfg *CircuitBreakerConfig,
+	poolCfg *ConnectionPoolConfig,
+	transport *http.Transport,
+) *Backend {
+
+	weight := 1
+	if beConfig.Weight > 0 {
+		weight = beConfig.Weight
+	}
+
+	var cb *gobreaker.CircuitBreaker
+	if cbCfg != nil && cbCfg.Enabled {
+		st := gobreaker.Settings{
+			Name: beConfig.Addr,
+			ReadyToTrip: func(counts gobreaker.Counts) bool {
+				return counts.ConsecutiveFailures > cbCfg.ConsecutiveFailures
+			},
+			Timeout: cbCfg.OpenStateTimeout,
+			OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+				slog.Warn("CircuitBreaker state changed", "backend", name, "from", from.String(), "to", to.String())
+			},
+		}
+		cb = gobreaker.NewCircuitBreaker(st)
+	}
+
+	parsedURL, err := url.Parse("http://" + beConfig.Addr)
+	if err != nil {
+		slog.Error("Failed to parse backend URL", "url", beConfig.Addr, "error", err)
+		return nil
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(parsedURL)
+	proxy.Transport = transport
+	originalDirector := proxy.Director
+	proxy.Director = func(r *http.Request) {
+		originalHost := r.Host
+		originalProto := "http"
+		if r.TLS != nil {
+			originalProto = "https"
+		}
+		originalDirector(r)
+		r.Header.Set("X-Forwarded-Host", originalHost)
+		r.Header.Set("X-Forwarded-Proto", originalProto)
+	}
+
+	return &Backend{
+		Addr:      beConfig.Addr,
+		Weight:    weight,
+		cb:        cb,
+		parsedURL: parsedURL,
+		proxy:     proxy,
+	}
+}
+
 // CHANGED: NewBackendPool now creates the shared transport and proxies
 func NewBackendPool(
-	strategy string,
-	backendConfigs []*BackendConfig,
+	routeCfg *RouteConfig, // <-- CHANGED: Pass the whole RouteConfig
+	consul *ConsulClient, // <-- ADD THIS
 	cbCfg *CircuitBreakerConfig,
 	poolCfg *ConnectionPoolConfig,
 ) *BackendPool {
+
+	pool := &BackendPool{
+		strategy: routeCfg.Strategy,
+		backends: make([]*Backend, 0),
+	}
+
+	// If a service name is provided, use service discovery
+	if routeCfg.Service != "" {
+		if consul == nil {
+			slog.Error("Service discovery configured but Consul client is nil", "service", routeCfg.Service)
+			return pool // Return an empty, non-functional pool
+		}
+		// Start watching Consul for updates.
+		// UpdateBackends will be called with the initial list and all changes.
+		consul.WatchService(routeCfg.Service, pool, cbCfg, poolCfg)
+
+	} else {
+		// No service discovery, use static backends from config
+		// This uses a map for the initial build
+		staticBackends := make(map[string]*BackendConfig)
+		for _, bc := range routeCfg.Backends {
+			staticBackends[bc.Addr] = bc
+		}
+		// Build the initial list
+		pool.buildBackends(staticBackends, cbCfg, poolCfg)
+		// Start our own health checks
+		pool.StartHealthChecks()
+	}
+
+	return pool
+}
+
+func (p *BackendPool) buildBackends(
+	backendConfigs map[string]*BackendConfig,
+	cbCfg *CircuitBreakerConfig,
+	poolCfg *ConnectionPoolConfig,
+) {
 
 	var transport *http.Transport
 	if poolCfg != nil {
@@ -76,67 +171,73 @@ func NewBackendPool(
 
 	backends := make([]*Backend, 0, len(backendConfigs))
 	for _, bc := range backendConfigs {
-		weight := 1
-		if bc.Weight > 0 {
-			weight = bc.Weight
+		if be := p.newBackend(bc, cbCfg, poolCfg, transport); be != nil {
+			backends = append(backends, be)
 		}
-		var cb *gobreaker.CircuitBreaker
-		if cbCfg != nil && cbCfg.Enabled {
-			st := gobreaker.Settings{
-				Name: bc.Addr,
-				ReadyToTrip: func(counts gobreaker.Counts) bool {
-					return counts.ConsecutiveFailures > cbCfg.ConsecutiveFailures
-				},
-				Timeout: cbCfg.OpenStateTimeout,
-				OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
-					slog.Warn("CircuitBreaker state changed", "backend", name, "from", from.String(), "to", to.String())
-				},
-			}
-			cb = gobreaker.NewCircuitBreaker(st)
-		}
-
-		parsedURL, err := url.Parse("http://" + bc.Addr)
-		if err != nil {
-			slog.Error("Failed to parse backend URL", "url", bc.Addr, "error", err)
-			continue
-		}
-
-		proxy := httputil.NewSingleHostReverseProxy(parsedURL)
-		proxy.Transport = transport
-
-		// Save the default director created by NewSingleHostReverseProxy
-		originalDirector := proxy.Director
-
-		// Create a new director that wraps the original
-		proxy.Director = func(r *http.Request) {
-			// Get the original request's host and protocol
-			originalHost := r.Host
-			originalProto := "http"
-			if r.TLS != nil {
-				originalProto = "https"
-			}
-
-			// Run the default director first
-			originalDirector(r)
-
-			// Set the X-Forwarded-Host to the original host
-			r.Header.Set("X-Forwarded-Host", originalHost)
-			// Set the X-Forwarded-Proto
-			r.Header.Set("X-Forwarded-Proto", originalProto)
-		}
-
-		backends = append(backends, &Backend{
-			Addr:      bc.Addr,
-			Weight:    weight,
-			cb:        cb,
-			parsedURL: parsedURL,
-			proxy:     proxy,
-		})
 	}
-	return &BackendPool{
-		backends: backends,
-		strategy: strategy,
+	p.backends = backends
+}
+
+// This method atomically updates the list of backends in the pool
+func (p *BackendPool) UpdateBackends(
+	newBackends map[string]*BackendConfig,
+	cbCfg *CircuitBreakerConfig,
+	poolCfg *ConnectionPoolConfig,
+) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	// We need to re-create the transport
+	var transport *http.Transport
+	if poolCfg != nil {
+		transport = &http.Transport{
+			MaxIdleConns:        poolCfg.MaxIdleConns,
+			MaxIdleConnsPerHost: poolCfg.MaxIdleConnsPerHost,
+			IdleConnTimeout:     poolCfg.IdleConnTimeout,
+		}
+	} else {
+		transport = &http.Transport{}
 	}
+
+	currentBackends := make(map[string]*Backend)
+	finalBackends := make([]*Backend, 0, len(newBackends))
+
+	for _, be := range p.backends {
+		currentBackends[be.Addr] = be
+	}
+
+	for addr, beConfig := range newBackends {
+		if existing, ok := currentBackends[addr]; ok {
+			// Backend already exists, just update weight and add it
+			existing.Weight = beConfig.Weight
+			if existing.Weight == 0 {
+				existing.Weight = 1
+			}
+			// IMPORTANT: We must also update its health status
+			existing.SetHealth(true) // Consul says it's passing
+			finalBackends = append(finalBackends, existing)
+
+		} else {
+			// New backend, create it with all features
+			slog.Info("Service discovery: new backend found", "addr", addr)
+			if be := p.newBackend(beConfig, cbCfg, poolCfg, transport); be != nil {
+				be.SetHealth(true) // Consul says it's passing
+				finalBackends = append(finalBackends, be)
+			}
+		}
+	}
+
+	// Mark any backends that are in our list but not in Consul's
+	for addr, be := range currentBackends {
+		if _, ok := newBackends[addr]; !ok {
+			slog.Warn("Service discovery: backend removed", "addr", addr)
+			be.SetHealth(false)
+			finalBackends = append(finalBackends, be) // Keep it, but mark as down
+		}
+	}
+
+	p.backends = finalBackends
+	slog.Info("Backend pool updated via service discovery", "service", p.strategy, "count", len(p.backends))
 }
 
 func (p *BackendPool) healthCheck(b *Backend) {
@@ -160,6 +261,12 @@ func (p *BackendPool) healthCheck(b *Backend) {
 }
 
 func (p *BackendPool) StartHealthChecks() {
+	// Only run if we have backends (i.e., not in service discovery mode)
+	if len(p.backends) == 0 {
+		slog.Debug("Skipping health checks for service discovery pool")
+		return
+	}
+
 	slog.Info("Starting health checks", "backend_count", len(p.backends))
 	for _, b := range p.backends {
 		go p.healthCheck(b)

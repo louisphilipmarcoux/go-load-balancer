@@ -10,6 +10,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type ConsulConfig struct {
+	Addr string `env:"CONSUL_ADDR"`
+}
+
 type RedisConfig struct {
 	Addr     string `env:"REDIS_ADDR"`
 	Password string `env:"REDIS_PASSWORD"`
@@ -29,6 +33,7 @@ type Config struct {
 	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
 	Cache          *CacheConfig          `yaml:"cache"`
 	Redis          *RedisConfig          `yaml:"redis"`
+	Consul         *ConsulConfig         `yaml:"consul"`
 	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
@@ -75,6 +80,7 @@ type RouteConfig struct {
 	Headers  map[string]string `yaml:"headers"  json:"headers,omitempty"`
 	Strategy string            `yaml:"strategy" json:"strategy"`
 	Backends []*BackendConfig  `yaml:"backends" json:"backends"`
+	Service  string            `yaml:"service"  json:"service,omitempty"`
 }
 type BackendConfig struct {
 	Addr   string `yaml:"addr"   json:"addr"`
@@ -105,6 +111,10 @@ func LoadConfig(path string) (*Config, error) {
 	// This allows env.Parse to populate it even if it's not in the YAML.
 	if cfg.Redis == nil {
 		cfg.Redis = &RedisConfig{}
+	}
+
+	if cfg.Consul == nil {
+		cfg.Consul = &ConsulConfig{}
 	}
 
 	// 2. NEW: Override with environment variables

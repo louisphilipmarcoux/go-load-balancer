@@ -56,23 +56,17 @@ routes:
   - host: "api.example.com"
     path: "/"
     strategy: "round-robin"
-    backends:
-      - addr: "backend1:9001"
-        weight: 1
+    service: "api-service"
 
   - path: "/"
     headers:
       "User-Agent": "MobileApp"
     strategy: "round-robin"
-    backends:
-      - addr: "backend2:9002"
-        weight: 1
+    service: "mobile-service"
 
   # ---
   # THIS MUST BE THE LAST ROUTE
   # ---
   - path: "/" # This catches everything else
     strategy: "weighted-least-connections"
-    backends:
-      - addr: "backend3:9003"
-        weight: 1
+    service: "web-service"
