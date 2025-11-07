@@ -63,7 +63,7 @@ func (c *ConsulClient) WatchService(
 				if addr == "" {
 					addr = service.Node.Address
 				}
-				
+
 				be := &BackendConfig{
 					Addr:   fmt.Sprintf("%s:%d", addr, service.Service.Port),
 					Weight: service.Service.Weights.Passing,
@@ -73,7 +73,7 @@ func (c *ConsulClient) WatchService(
 				}
 				newBackends[be.Addr] = be
 			}
-			
+
 			// Atomically update the backend pool with the new list
 			pool.UpdateBackends(newBackends, cbCfg, poolCfg)
 		}
