@@ -9,7 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http" // NEW
+	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -17,18 +18,18 @@ import (
 	"github.com/sony/gobreaker"
 )
 
-// A private key type to prevent context collisions
+// contextKey and Route struct (Unchanged)
 type contextKey string
 
 const loggerKey = contextKey("logger")
 
-// ... (Route struct, Matches, LoadBalancer struct, CacheItem, NewLoadBalancer - no changes) ...
 type Route struct {
 	config  *RouteConfig
 	pool    *BackendPool
 	handler http.Handler
 }
 
+// Matches (Unchanged)
 func (rt *Route) Matches(r *http.Request) bool {
 	if rt.config.Host != "" && rt.config.Host != r.Host {
 		return false
@@ -44,54 +45,48 @@ func (rt *Route) Matches(r *http.Request) bool {
 	return true
 }
 
+// LoadBalancer struct
 type LoadBalancer struct {
-	cfg    *Config
-	consul *ConsulClient
-	routes []*Route
-	rl     *RateLimiter
-	cache  *cache.Cache
-	lock   sync.RWMutex
+	cfg        *Config
+	discoverer ServiceDiscoverer
+	routes     []*Route                // L7 routes
+	l4Pools    map[string]*BackendPool // L4 pools, mapped by listener name
+	rl         *RateLimiter
+	cache      *cache.Cache
+	lock       sync.RWMutex
 }
 
+// CacheItem (Unchanged)
 type CacheItem struct {
 	Status int
 	Header http.Header
 	Body   []byte
 }
 
+// reloadConfig_unsafe (CHANGED)
 func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
-	// Re-create consul client on reload (in case addr changed)
 	if cfg.Consul != nil && cfg.Consul.Addr != "" {
-		consulClient, err := NewConsulClient(cfg.Consul.Addr)
+		discoverer, err := NewConsulClient(cfg.Consul.Addr)
 		if err != nil {
 			slog.Error("Failed to re-initialize Consul client", "error", err)
-			lb.consul = nil
+			lb.discoverer = nil
 		} else {
-			lb.consul = consulClient
+			lb.discoverer = discoverer
 		}
 	} else {
-		lb.consul = nil
+		lb.discoverer = nil
 	}
 
-	newRoutes := lb.buildRoutes(cfg)
-	var newRl *RateLimiter
-	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
-		newRl = NewRateLimiter(cfg)
-	}
-	var newCache *cache.Cache
-	if cfg.Cache != nil && cfg.Cache.Enabled {
-		newCache = cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
-		slog.Info("Cache enabled", "expiration", cfg.Cache.DefaultExpiration)
-	}
+	newRoutes := lb.buildL7Routes(cfg)
+	newL4Pools := lb.buildL4Pools(cfg)
+
 	lb.cfg = cfg
 	lb.routes = newRoutes
-	lb.rl = newRl
-	lb.cache = newCache
+	lb.l4Pools = newL4Pools
 	slog.Info("Configuration successfully reloaded (unsafe)")
 }
 
-// Add this method back to internal/lb/loadbalancer.go
-
+// ReloadConfig (Unchanged)
 func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
@@ -99,199 +94,237 @@ func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 	slog.Info("Configuration successfully reloaded (safe)")
 }
 
+// NewLoadBalancer (Unchanged)
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
 
-	// Create the Consul client *first*
 	if cfg.Consul != nil && cfg.Consul.Addr != "" {
-		consulClient, err := NewConsulClient(cfg.Consul.Addr)
+		discoverer, err := NewConsulClient(cfg.Consul.Addr)
 		if err != nil {
 			slog.Error("Failed to initialize Consul client, service discovery will fail", "error", err)
 		} else {
-			// Only assign the client on success
-			lb.consul = consulClient
+			lb.discoverer = discoverer
 		}
 	}
 
-	// --- THIS IS THE CHANGE ---
-	// Create the rate limiter
-	if cfg.RateLimit != nil && cfg.RateLimit.Enabled {
-		lb.rl = NewRateLimiter(cfg) // NewRateLimiter now takes the whole config
-		if lb.rl == nil {
-			slog.Warn("Rate limiter initialization failed, disabling.")
+	for _, l := range cfg.Listeners {
+		if l.Protocol == "http" || l.Protocol == "https" {
+			if l.RateLimit != nil && l.RateLimit.Enabled {
+				lb.rl = NewRateLimiter(l.RateLimit, cfg.Redis)
+				if lb.rl == nil {
+					slog.Warn("Rate limiter initialization failed, disabling.")
+				}
+			}
+			if l.Cache != nil && l.Cache.Enabled {
+				lb.cache = cache.New(l.Cache.DefaultExpiration, l.Cache.CleanupInterval)
+				slog.Info("Cache enabled", "expiration", l.Cache.DefaultExpiration)
+			}
+			break
 		}
 	}
-	// Create the cache
-	if cfg.Cache != nil && cfg.Cache.Enabled {
-		lb.cache = cache.New(cfg.Cache.DefaultExpiration, cfg.Cache.CleanupInterval)
-		slog.Info("Cache enabled", "expiration", cfg.Cache.DefaultExpiration)
-	}
 
-	// Build routes (this is now done *after* creating dependencies)
-	lb.routes = lb.buildRoutes(cfg)
-	lb.cfg = cfg // Set the config
-
-	// lb.ReloadConfig(cfg) // We no longer need to call this
-	// --- END CHANGE ---
+	lb.routes = lb.buildL7Routes(cfg)
+	lb.l4Pools = lb.buildL4Pools(cfg)
+	lb.cfg = cfg
 
 	slog.Info("Load balancer initialized")
 	return lb
 }
 
-// ... (buildRoutes - no changes) ...
-func (lb *LoadBalancer) buildRoutes(cfg *Config) []*Route {
-	routes := make([]*Route, 0, len(cfg.Routes))
-	for _, routeCfg := range cfg.Routes {
-		pool := NewBackendPool(
-			routeCfg,
-			lb.consul, // <-- PASS THE CONSUL CLIENT
-			cfg.CircuitBreaker,
-			cfg.ConnectionPool,
-		)
-		pool.StartHealthChecks()
-		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// --- Start Logger Retrieval ---
-			// 1. Get the logger from the context
-			logger, ok := r.Context().Value(loggerKey).(*slog.Logger)
-			if !ok {
-				logger = slog.Default() // Fallback just in case
-			}
-
-			// 2. Add route-specific context!
-			logger = logger.With(
-				"route_path", routeCfg.Path,
-				"route_host", routeCfg.Host,
+// buildL4Pools (CHANGED)
+func (lb *LoadBalancer) buildL4Pools(cfg *Config) map[string]*BackendPool {
+	pools := make(map[string]*BackendPool)
+	for _, listenerCfg := range cfg.Listeners {
+		// CHANGED: Now includes "udp"
+		if listenerCfg.Protocol == "tcp" || listenerCfg.Protocol == "udp" {
+			slog.Info("Building L4 pool", "listener", listenerCfg.Name, "protocol", listenerCfg.Protocol)
+			pools[listenerCfg.Name] = NewL4BackendPool(
+				listenerCfg,
+				lb.discoverer,
+				cfg.CircuitBreaker,
 			)
-			// --- End Logger Retrieval ---
+		}
+	}
+	return pools
+}
 
-			lb.lock.RLock()
-			cacheEnabled := lb.cache != nil
-			lb.lock.RUnlock()
-			var cacheKey string
+// buildL7Routes (Unchanged)
+func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
+	routes := make([]*Route, 0)
+	for _, listenerCfg := range cfg.Listeners {
+		if listenerCfg.Protocol != "http" && listenerCfg.Protocol != "https" {
+			continue
+		}
 
-			if cacheEnabled && r.Method == http.MethodGet {
-				cacheKey = r.Host + r.URL.Path
-				if item, found := lb.cache.Get(cacheKey); found {
-					// Use our new logger
-					logger.Debug("Cache hit", "key", cacheKey)
-					cachedItem := item.(CacheItem)
-					for key, values := range cachedItem.Header {
-						for _, value := range values {
-							w.Header().Add(key, value)
+		for _, routeCfg := range listenerCfg.Routes {
+			routeCfg := routeCfg // Capture loop variable
+			pool := NewL7BackendPool(
+				routeCfg,
+				lb.discoverer,
+				cfg.CircuitBreaker,
+				cfg.ConnectionPool,
+			)
+
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				logger, ok := r.Context().Value(loggerKey).(*slog.Logger)
+				if !ok {
+					logger = slog.Default()
+				}
+				logger = logger.With(
+					"route_path", routeCfg.Path,
+					"route_host", routeCfg.Host,
+				)
+
+				lb.lock.RLock()
+				cacheEnabled := lb.cache != nil
+				lb.lock.RUnlock()
+				var cacheKey string
+				if cacheEnabled && r.Method == http.MethodGet {
+					cacheKey = r.Host + r.URL.Path
+					if item, found := lb.cache.Get(cacheKey); found {
+						logger.Debug("Cache hit", "key", cacheKey)
+						cachedItem := item.(CacheItem)
+						for key, values := range cachedItem.Header {
+							for _, value := range values {
+								w.Header().Add(key, value)
+							}
 						}
+						w.WriteHeader(cachedItem.Status)
+						if _, err := w.Write(cachedItem.Body); err != nil {
+							logger.Warn("Error writing cached response", "error", err)
+						}
+						return
 					}
-					w.WriteHeader(cachedItem.Status)
-					if _, err := w.Write(cachedItem.Body); err != nil {
-						logger.Warn("Error writing cached response", "error", err) // Use logger
+					logger.Debug("Cache miss", "key", cacheKey)
+				}
+
+				clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+				backend := pool.GetNextBackend(r, clientIP)
+				if backend == nil {
+					logger.Warn("No healthy backend found for request")
+					http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				logger = logger.With("backend_addr", backend.Addr)
+
+				strategyNeedsConns := pool.strategy == "least-connections" || pool.strategy == "weighted-least-connections"
+				if strategyNeedsConns {
+					backend.IncrementConnections()
+					defer func() {
+						backend.DecrementConnections()
+					}()
+				}
+
+				recorder := &CachingRecorder{
+					ResponseWriter: w,
+					Status:         http.StatusOK,
+					Body:           new(bytes.Buffer),
+				}
+				var requestErr error
+				if backend.cb != nil {
+					_, requestErr = backend.cb.Execute(func() (interface{}, error) {
+						logger.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr, "circuit_state", backend.cb.State().String())
+						backend.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+							logger.Warn("Backend connection error", "backend", backend.Addr, "error", err)
+						}
+						backend.proxy.ServeHTTP(recorder, r)
+						if recorder.Status >= http.StatusInternalServerError {
+							return nil, fmt.Errorf("backend %s returned status %d", backend.Addr, recorder.Status)
+						}
+						return nil, nil
+					})
+				} else {
+					logger.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr)
+					backend.proxy.ServeHTTP(recorder, r)
+				}
+				if requestErr != nil {
+					if errors.Is(requestErr, gobreaker.ErrOpenState) || errors.Is(requestErr, gobreaker.ErrTooManyRequests) {
+						logger.Warn("Request blocked by circuit breaker", "backend", backend.Addr, "state", backend.cb.State().String())
+						http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
+					} else {
+						logger.Warn("Circuit breaker failure recorded", "backend", backend.Addr, "error", requestErr)
+						if !recorder.wroteHeader {
+							http.Error(w, "Bad Gateway", http.StatusBadGateway)
+						}
 					}
 					return
 				}
-				logger.Debug("Cache miss", "key", cacheKey) // Use logger
-			}
-			backend := pool.GetNextBackend(r)
-			if backend == nil {
-				// Use logger. All context (req_id, client_ip, route) is added automatically.
-				logger.Warn("No healthy backend found for request")
-				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
-				return
-			}
 
-			// Add backend context for all subsequent logs
-			logger = logger.With("backend_addr", backend.Addr)
-
-			strategyNeedsConns := pool.strategy == "least-connections" || pool.strategy == "weighted-least-connections"
-			if strategyNeedsConns {
-				backend.IncrementConnections()
-				defer func() {
-					backend.DecrementConnections()
-				}()
-			}
-			recorder := &CachingRecorder{
-				ResponseWriter: w,
-				Status:         http.StatusOK,
-				Body:           new(bytes.Buffer),
-			}
-			var requestErr error
-			if backend.cb != nil {
-				_, requestErr = backend.cb.Execute(func() (interface{}, error) {
-					logger.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr, "circuit_state", backend.cb.State().String())
-					backend.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-						logger.Warn("Backend connection error", "backend", backend.Addr, "error", err)
+				if cacheEnabled && r.Method == http.MethodGet && recorder.Status < 500 {
+					item := CacheItem{
+						Status: recorder.Status,
+						Header: recorder.Header().Clone(),
+						Body:   recorder.Body.Bytes(),
 					}
-					backend.proxy.ServeHTTP(recorder, r)
-					if recorder.Status >= http.StatusInternalServerError {
-						return nil, fmt.Errorf("backend %s returned status %d", backend.Addr, recorder.Status)
-					}
-					return nil, nil
-				})
-			} else {
-				logger.Info("Proxying request", "host", r.Host, "path", r.URL.Path, "backend", backend.Addr)
-				backend.proxy.ServeHTTP(recorder, r)
-			}
-			if requestErr != nil {
-				if errors.Is(requestErr, gobreaker.ErrOpenState) || errors.Is(requestErr, gobreaker.ErrTooManyRequests) {
-					logger.Warn("Request blocked by circuit breaker", "backend", backend.Addr, "state", backend.cb.State().String())
-					http.Error(w, "Service unavailable (Circuit OPEN)", http.StatusServiceUnavailable)
-				} else {
-					logger.Warn("Circuit breaker failure recorded", "backend", backend.Addr, "error", requestErr)
-					if !recorder.wroteHeader {
-						http.Error(w, "Bad Gateway", http.StatusBadGateway)
-					}
+					logger.Debug("Caching response", "key", cacheKey, "size_bytes", len(item.Body))
+					lb.cache.Set(cacheKey, item, cache.DefaultExpiration)
 				}
-				return
-			}
-			if cacheEnabled && r.Method == http.MethodGet && recorder.Status < 500 {
-				item := CacheItem{
-					Status: recorder.Status,
-					Header: recorder.Header().Clone(),
-					Body:   recorder.Body.Bytes(),
+				if !recorder.wroteHeader {
+					recorder.ResponseWriter.WriteHeader(recorder.Status)
 				}
-				logger.Debug("Caching response", "key", cacheKey, "size_bytes", len(item.Body))
-				lb.cache.Set(cacheKey, item, cache.DefaultExpiration)
-			}
-			if !recorder.wroteHeader {
-				recorder.ResponseWriter.WriteHeader(recorder.Status)
-			}
-			if _, err := recorder.ResponseWriter.Write(recorder.Body.Bytes()); err != nil {
-				logger.Warn("Error writing final response", "error", err)
-			}
-		})
-		routes = append(routes, &Route{
-			config:  routeCfg,
-			pool:    pool,
-			handler: handler,
-		})
+				if _, err := recorder.ResponseWriter.Write(recorder.Body.Bytes()); err != nil {
+					logger.Warn("Error writing final response", "error", err)
+				}
+			})
+			routes = append(routes, &Route{
+				config:  routeCfg,
+				pool:    pool,
+				handler: handler,
+			})
+		}
 	}
+
+	// Sort routes from most specific to least specific.
+	// This is CRITICAL so that routes with a 'Host' are
+	// matched before a generic 'path: "/"' route.
+	sort.Slice(routes, func(i, j int) bool {
+		r1 := routes[i].config
+		r2 := routes[j].config
+
+		// Rule 1: Host presence (routes with a host come first)
+		if r1.Host != "" && r2.Host == "" {
+			return true // r1 is more specific
+		}
+		if r1.Host == "" && r2.Host != "" {
+			return false // r2 is more specific
+		}
+
+		// Rule 2: Path length (longer paths come first)
+		// (Both have a host or both have no host, so compare path length)
+		if len(r1.Path) > len(r2.Path) {
+			return true // r1 is more specific
+		}
+		if len(r1.Path) < len(r2.Path) {
+			return false // r2 is more specific
+		}
+
+		// Rule 3: Host length (fallback for stable ordering)
+		return len(r1.Host) > len(r2.Host)
+	})
+
 	return routes
 }
+
+// getRoutes (Unchanged)
 func (lb *LoadBalancer) getRoutes() []*Route {
 	lb.lock.RLock()
 	defer lb.lock.RUnlock()
 	return lb.routes
 }
+
+// ServeHTTP (Unchanged)
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// --- Start Contextual Logger ---
-	// 1. Generate a unique Request ID
 	reqIDBytes := make([]byte, 6)
 	if _, err := rand.Read(reqIDBytes); err != nil {
-		slog.Warn("Failed to generate request ID", "error", err) // Use global logger for this one error
+		slog.Warn("Failed to generate request ID", "error", err)
 	}
 	reqID := hex.EncodeToString(reqIDBytes)
-
-	// 2. Get Client IP
 	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-
-	// 3. Create a new logger with request-specific attributes
 	logger := slog.Default().With(
 		"req_id", reqID,
 		"client_ip", clientIP,
 	)
-
-	// 4. Store the logger in the request's context
 	r = r.WithContext(context.WithValue(r.Context(), loggerKey, logger))
-	// --- End Contextual Logger ---
-
-	// Add the Request ID to the response headers so the client can see it
 	w.Header().Set("X-Request-ID", reqID)
 
 	lb.lock.RLock()
@@ -299,10 +332,6 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.lock.RUnlock()
 
 	if limiterEnabled {
-		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-
-		// --- THIS IS THE CHANGE ---
-		// We no longer get a "limiter" object, we just ask to "Allow"
 		if !lb.rl.Allow(clientIP) {
 			logger.Warn("Global rate limit exceeded")
 			http.Error(w, "429 Too Many Requests", http.StatusTooManyRequests)
@@ -321,58 +350,42 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// --- Admin API Helper Methods (NOW FIXED) ---
-
-// getRouteByIndex finds a route by its index in the config
-func (lb *LoadBalancer) getRouteByIndex(index int) (*RouteConfig, error) {
-	if index < 0 || index >= len(lb.cfg.Routes) {
+// --- Admin API Helper Methods (Unchanged) ---
+func (lb *LoadBalancer) getRouteByIndex(listener *ListenerConfig, index int) (*RouteConfig, error) {
+	if index < 0 || index >= len(listener.Routes) {
 		return nil, fmt.Errorf("route index %d out of bounds", index)
 	}
-	return lb.cfg.Routes[index], nil
+	return listener.Routes[index], nil
 }
-
-// AddRoute adds a new route to the config and reloads
-func (lb *LoadBalancer) AddRoute(newRoute *RouteConfig) error {
+func (lb *LoadBalancer) AddRoute(listener *ListenerConfig, newRoute *RouteConfig) error {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
-
-	for _, route := range lb.cfg.Routes {
+	for _, route := range listener.Routes {
 		if route.Path == newRoute.Path && route.Host == newRoute.Host {
 			return fmt.Errorf("route with path '%s' and host '%s' already exists", newRoute.Path, newRoute.Host)
 		}
 	}
-	lb.cfg.Routes = append(lb.cfg.Routes, newRoute)
-
-	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	listener.Routes = append(listener.Routes, newRoute)
+	lb.reloadConfig_unsafe(lb.cfg)
 	return nil
 }
-
-// DeleteRoute removes a route from the config and reloads
-func (lb *LoadBalancer) DeleteRoute(index int) error {
+func (lb *LoadBalancer) DeleteRoute(listener *ListenerConfig, index int) error {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
-
-	if _, err := lb.getRouteByIndex(index); err != nil {
+	if _, err := lb.getRouteByIndex(listener, index); err != nil {
 		return err
 	}
-
-	// Remove element at index
-	lb.cfg.Routes = append(lb.cfg.Routes[:index], lb.cfg.Routes[index+1:]...)
-
-	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	listener.Routes = append(listener.Routes[:index], listener.Routes[index+1:]...)
+	lb.reloadConfig_unsafe(lb.cfg)
 	return nil
 }
-
-// AddBackendToRoute adds a backend to a specific route and reloads
-func (lb *LoadBalancer) AddBackendToRoute(index int, newBackend *BackendConfig) error {
+func (lb *LoadBalancer) AddBackendToRoute(listener *ListenerConfig, index int, newBackend *BackendConfig) error {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
-
-	route, err := lb.getRouteByIndex(index)
+	route, err := lb.getRouteByIndex(listener, index)
 	if err != nil {
 		return err
 	}
-
 	for _, be := range route.Backends {
 		if be.Addr == newBackend.Addr {
 			return fmt.Errorf("backend '%s' already exists in route %d", newBackend.Addr, index)
@@ -382,21 +395,16 @@ func (lb *LoadBalancer) AddBackendToRoute(index int, newBackend *BackendConfig) 
 		newBackend.Weight = 1
 	}
 	route.Backends = append(route.Backends, newBackend)
-
-	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	lb.reloadConfig_unsafe(lb.cfg)
 	return nil
 }
-
-// DeleteBackendFromRoute removes a backend from a specific route and reloads
-func (lb *LoadBalancer) DeleteBackendFromRoute(index int, host string) error {
+func (lb *LoadBalancer) DeleteBackendFromRoute(listener *ListenerConfig, index int, host string) error {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
-
-	route, err := lb.getRouteByIndex(index)
+	route, err := lb.getRouteByIndex(listener, index)
 	if err != nil {
 		return err
 	}
-
 	found := false
 	newBackends := make([]*BackendConfig, 0)
 	for _, be := range route.Backends {
@@ -410,17 +418,13 @@ func (lb *LoadBalancer) DeleteBackendFromRoute(index int, host string) error {
 		return fmt.Errorf("backend '%s' not found in route %d", host, index)
 	}
 	route.Backends = newBackends
-
-	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	lb.reloadConfig_unsafe(lb.cfg)
 	return nil
 }
-
-// UpdateBackendWeightInRoute updates a backend's weight in a route and reloads
-func (lb *LoadBalancer) UpdateBackendWeightInRoute(index int, host string, weight int) error {
+func (lb *LoadBalancer) UpdateBackendWeightInRoute(listener *ListenerConfig, index int, host string, weight int) error {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
-
-	route, err := lb.getRouteByIndex(index)
+	route, err := lb.getRouteByIndex(listener, index)
 	if err != nil {
 		return err
 	}
@@ -438,7 +442,6 @@ func (lb *LoadBalancer) UpdateBackendWeightInRoute(index int, host string, weigh
 	if !found {
 		return fmt.Errorf("backend '%s' not found in route %d", host, index)
 	}
-
-	lb.reloadConfig_unsafe(lb.cfg) // Call the unsafe version
+	lb.reloadConfig_unsafe(lb.cfg)
 	return nil
 }

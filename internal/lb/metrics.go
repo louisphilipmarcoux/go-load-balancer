@@ -31,16 +31,17 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		lb.lock.RLock()
 		routes := lb.routes
+		l4Pools := lb.l4Pools
 		cache := lb.cache
 		lb.lock.RUnlock()
 
 		var body string
 		var totalConns uint64
 
+		// L7 Routes
 		for _, route := range routes {
 			totalConns += route.pool.GetTotalConnections()
 			for _, b := range route.pool.backends {
-				// ... (metric generation logic - no changes) ...
 				health := 0
 				if b.IsHealthy() {
 					health = 1
@@ -66,6 +67,37 @@ func StartMetricsServer(addr string, lb *LoadBalancer) {
 				body += "\n"
 			}
 		}
+
+		// L4 Pools
+		for listenerName, pool := range l4Pools {
+			totalConns += pool.GetTotalConnections()
+			for _, b := range pool.backends {
+				health := 0
+				if b.IsHealthy() {
+					health = 1
+				}
+				label := fmt.Sprintf("backend=\"%s\", listener_name=\"%s\"",
+					b.Addr, listenerName)
+				body += fmt.Sprintf("backend_health_status{%s} %d\n", label, health)
+				conns := b.GetConnections()
+				body += fmt.Sprintf("backend_active_connections{%s} %d\n", label, conns)
+				if b.cb != nil {
+					state := b.cb.State()
+					var stateNum int
+					switch state {
+					case gobreaker.StateClosed:
+						stateNum = 0
+					case gobreaker.StateHalfOpen:
+						stateNum = 1
+					case gobreaker.StateOpen:
+						stateNum = 2
+					}
+					body += fmt.Sprintf("backend_circuit_state{%s} %d\n", label, stateNum)
+				}
+				body += "\n"
+			}
+		}
+
 		body += "\n"
 		body += fmt.Sprintf("total_active_connections %d\n", totalConns)
 		if cache != nil {

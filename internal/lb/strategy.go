@@ -12,13 +12,16 @@ import (
 )
 
 // GetNextBackend selects a backend using the pool's strategy
-func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
+func (p *BackendPool) GetNextBackend(r *http.Request, clientIP string) *Backend {
 	switch p.strategy {
 	case "ip-hash":
-		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			slog.Warn("Failed to get client IP for ip-hash", "error", err, "fallback", "round-robin")
+		if clientIP == "" {
+			slog.Warn("IP for ip-hash is empty, falling back", "fallback", "round-robin")
 			return p.GetNextBackendByRoundRobin()
+		}
+		// Clean the IP if it has a port (e.g., from RemoteAddr)
+		if host, _, err := net.SplitHostPort(clientIP); err == nil {
+			clientIP = host
 		}
 		return p.GetNextBackendByIP(clientIP)
 	case "least-connections":
@@ -36,6 +39,7 @@ func (p *BackendPool) GetNextBackend(r *http.Request) *Backend {
 
 // --- Strategy Implementations ---
 
+// GetNextBackendByIP (Unchanged)
 func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	healthyBackends := make([]*Backend, 0)
 	for _, backend := range p.backends {
@@ -52,6 +56,7 @@ func (p *BackendPool) GetNextBackendByIP(ip string) *Backend {
 	return healthyBackends[index]
 }
 
+// GetNextBackendByLeastConns (Unchanged)
 func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	var bestBackend *Backend
 	minConnections := uint64(math.MaxUint64)
@@ -68,6 +73,7 @@ func (p *BackendPool) GetNextBackendByLeastConns() *Backend {
 	return bestBackend
 }
 
+// GetNextBackendByRoundRobin (Unchanged)
 func (p *BackendPool) GetNextBackendByRoundRobin() *Backend {
 	numBackends := uint64(len(p.backends))
 	if numBackends == 0 {
@@ -83,6 +89,7 @@ func (p *BackendPool) GetNextBackendByRoundRobin() *Backend {
 	return nil
 }
 
+// GetNextBackendByWeightedRoundRobin (Unchanged)
 func (p *BackendPool) GetNextBackendByWeightedRoundRobin() *Backend {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -105,6 +112,7 @@ func (p *BackendPool) GetNextBackendByWeightedRoundRobin() *Backend {
 	return bestBackend
 }
 
+// GetNextBackendByWeightedLeastConns (Unchanged)
 func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 	var bestBackend *Backend
 	minScore := math.Inf(1)
@@ -114,6 +122,9 @@ func (p *BackendPool) GetNextBackendByWeightedLeastConns() *Backend {
 		}
 		conns := float64(backend.GetConnections())
 		weight := float64(backend.Weight)
+		if weight == 0 { // Prevent divide by zero
+			weight = 1
+		}
 		score := conns / weight
 		if score < minScore {
 			minScore = score

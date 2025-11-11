@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
-	"log"      // Keep for the one-time Fatalf
-	"log/slog" // NEW
+	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,7 +18,7 @@ import (
 	"golang.org/x/crypto/acme/autocert"
 )
 
-// getTLSVersion maps a string config value to a Go tls.Version constant
+// --- Helper functions (getTLSVersion, getCipherSuites, startAutocertChallengeServer) ---
 func getTLSVersion(version string) uint16 {
 	switch version {
 	case "tls1.0":
@@ -30,27 +30,20 @@ func getTLSVersion(version string) uint16 {
 	case "tls1.3":
 		return tls.VersionTLS13
 	default:
-		// Default to a strong version if config is missing or invalid
 		return tls.VersionTLS12
 	}
 }
-
-// getCipherSuites maps a list of string names to Go tls.CipherSuite constants
 func getCipherSuites(names []string) []uint16 {
 	if len(names) == 0 {
-		return nil // Use Go's default cipher suites
+		return nil
 	}
-
-	// This map is built from Go's standard tls.CipherSuites() list
 	suiteMap := make(map[string]uint16)
 	for _, suite := range tls.CipherSuites() {
 		suiteMap[suite.Name] = suite.ID
 	}
-	// Add Go's non-standard (but still valid) names
 	for _, suite := range tls.InsecureCipherSuites() {
 		suiteMap[suite.Name] = suite.ID
 	}
-
 	var suites []uint16
 	for _, name := range names {
 		if id, ok := suiteMap[name]; ok {
@@ -61,7 +54,6 @@ func getCipherSuites(names []string) []uint16 {
 	}
 	return suites
 }
-
 func startAutocertChallengeServer(certManager *autocert.Manager) *http.Server {
 	server := &http.Server{
 		Addr:    ":80",
@@ -77,17 +69,63 @@ func startAutocertChallengeServer(certManager *autocert.Manager) *http.Server {
 	return server
 }
 
+// startHttpListener
+func startHttpListener(listenerCfg *lb.ListenerConfig, loadBalancer *lb.LoadBalancer) (mainServer *http.Server, autocertServer *http.Server) {
+	var tlsConfig *tls.Config
+	if listenerCfg.Autocert != nil && listenerCfg.Autocert.Enabled {
+		slog.Info("Autocert is enabled", "name", listenerCfg.Name)
+		certManager := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(listenerCfg.Autocert.Domains...),
+			Email:      listenerCfg.Autocert.Email,
+			Cache:      autocert.DirCache(listenerCfg.Autocert.CacheDir),
+		}
+		tlsConfig = certManager.TLSConfig()
+		autocertServer = startAutocertChallengeServer(certManager)
+	} else if listenerCfg.TLS != nil {
+		slog.Info("Using static TLS configuration", "name", listenerCfg.Name)
+		tlsConfig = &tls.Config{
+			MinVersion:   getTLSVersion(listenerCfg.TLS.MinVersion),
+			CipherSuites: getCipherSuites(listenerCfg.TLS.CipherSuites),
+		}
+	} else {
+		slog.Info("Listener has no TLS configured", "name", listenerCfg.Name)
+	}
+	server := &http.Server{
+		Addr:      listenerCfg.ListenAddr,
+		Handler:   loadBalancer,
+		TLSConfig: tlsConfig,
+	}
+	go func() {
+		var err error
+		if listenerCfg.Protocol == "https" && tlsConfig != nil {
+			slog.Info("HTTPS listener starting", "name", listenerCfg.Name, "addr", server.Addr)
+			if listenerCfg.Autocert != nil && listenerCfg.Autocert.Enabled {
+				err = server.ListenAndServeTLS("", "")
+			} else {
+				err = server.ListenAndServeTLS(listenerCfg.TLS.CertFile, listenerCfg.TLS.KeyFile)
+			}
+		} else {
+			slog.Info("HTTP listener starting", "name", listenerCfg.Name, "addr", server.Addr)
+			err = server.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Listener failed", "name", listenerCfg.Name, "protocol", listenerCfg.Protocol, "error", err)
+			os.Exit(1)
+		}
+	}()
+	return server, autocertServer
+}
+
 func main() {
-	// --- NEW: Structured Logger Setup ---
+	// --- Logger and Config setup ---
 	logLevel := new(slog.LevelVar)
-	logLevel.Set(slog.LevelInfo) // Default
+	logLevel.Set(slog.LevelInfo)
 	if os.Getenv("LOG_LEVEL") == "DEBUG" {
 		logLevel.Set(slog.LevelDebug)
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
-	// --- End Logger Setup ---
-
 	configPath := flag.String("config", "config.yaml", "Path to the configuration file")
 	flag.Parse()
 	cfg, err := lb.LoadConfig(*configPath)
@@ -95,70 +133,57 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Renamed from 'lb' to 'loadBalancer' to avoid shadowing the package name
 	loadBalancer := lb.NewLoadBalancer(cfg)
 
-	var tlsConfig *tls.Config
-	var autocertServer *http.Server
-
-	if cfg.Autocert != nil && cfg.Autocert.Enabled {
-		slog.Info("Autocert is enabled")
-		certManager := &autocert.Manager{
-			Prompt:     autocert.AcceptTOS,
-			HostPolicy: autocert.HostWhitelist(cfg.Autocert.Domains...),
-			Email:      cfg.Autocert.Email,
-			Cache:      autocert.DirCache(cfg.Autocert.CacheDir),
-		}
-		tlsConfig = certManager.TLSConfig()
-		autocertServer = startAutocertChallengeServer(certManager)
-
-	} else if cfg.TLS != nil {
-		slog.Info("Using static TLS configuration")
-		tlsConfig = &tls.Config{
-			MinVersion:   getTLSVersion(cfg.TLS.MinVersion),
-			CipherSuites: getCipherSuites(cfg.TLS.CipherSuites),
-		}
-	} else {
-		slog.Info("TLS is not configured")
-	}
-
-	server := &http.Server{
-		Addr:      cfg.ListenAddr,
-		Handler:   loadBalancer,
-		TLSConfig: tlsConfig,
-	}
-
-	go func() {
-		if cfg.Autocert != nil && cfg.Autocert.Enabled {
-			slog.Info("Load Balancer (L7/Autocert) listening", "addr", server.Addr)
-			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("Autocert load balancer failed", "error", err)
-				os.Exit(1)
-			}
-		} else if cfg.TLS != nil {
-			slog.Info("Load Balancer (L7/Static TLS) listening", "addr", server.Addr)
-			if err := server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("Static TLS load balancer failed", "error", err)
-				os.Exit(1)
-			}
-		} else {
-			slog.Info("Load Balancer (L7/HTTP) listening", "addr", server.Addr)
-			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("HTTP load balancer failed", "error", err)
-				os.Exit(1)
-			}
-		}
-	}()
-
+	// --- Global Services ---
 	if cfg.MetricsAddr != "" {
 		go lb.StartMetricsServer(cfg.MetricsAddr, loadBalancer)
 	}
-
 	var adminServer *http.Server
 	if cfg.AdminAddr != "" {
 		adminServer = lb.StartAdminServer(loadBalancer)
 	}
 
+	// --- Listener Loop ---
+	var httpServers []*http.Server
+	var tcpProxies []*lb.TcpProxy
+	var udpProxies []*lb.UDPProxy
+
+	for _, listenerCfg := range cfg.Listeners {
+		listenerCfg := listenerCfg // Capture loop variable
+
+		switch listenerCfg.Protocol {
+		case "http", "https":
+			mainServer, acmeServer := startHttpListener(listenerCfg, loadBalancer)
+			httpServers = append(httpServers, mainServer)
+			if acmeServer != nil {
+				httpServers = append(httpServers, acmeServer)
+			}
+
+		case "tcp":
+			proxy, err := lb.NewTcpProxy(listenerCfg, loadBalancer)
+			if err != nil {
+				slog.Error("Failed to create TCP proxy", "name", listenerCfg.Name, "error", err)
+				continue
+			}
+			tcpProxies = append(tcpProxies, proxy)
+			go proxy.Run()
+
+		case "udp":
+			proxy, err := lb.NewUDPProxy(listenerCfg, loadBalancer)
+			if err != nil {
+				slog.Error("Failed to create UDP proxy", "name", listenerCfg.Name, "error", err)
+				continue
+			}
+			udpProxies = append(udpProxies, proxy)
+			go proxy.Run()
+
+		default:
+			slog.Error("Unknown listener protocol, skipping", "name", listenerCfg.Name, "protocol", listenerCfg.Protocol)
+		}
+	}
+
+	// --- Signal Handling ---
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
@@ -170,16 +195,47 @@ func main() {
 			defer cancel()
 			var wg sync.WaitGroup
 
+			// --- Shutdown UDP Proxies ---
+			for _, proxy := range udpProxies {
+				proxy.Shutdown()
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := server.Shutdown(ctx); err != nil {
-					slog.Warn("Main server shutdown failed", "error", err)
-				} else {
-					slog.Info("Main server shutdown complete.")
+				for _, proxy := range udpProxies {
+					proxy.Wait()
 				}
+				slog.Info("All UDP listeners shut down.")
 			}()
 
+			// --- Shutdown TCP Proxies ---
+			for _, proxy := range tcpProxies {
+				proxy.Shutdown()
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for _, proxy := range tcpProxies {
+					proxy.Wait()
+				}
+				slog.Info("All TCP listeners shut down.")
+			}()
+
+			// --- Shutdown HTTP Servers ---
+			for _, srv := range httpServers {
+				wg.Add(1)
+				srv := srv
+				go func() {
+					defer wg.Done()
+					if err := srv.Shutdown(ctx); err != nil {
+						slog.Warn("HTTP server shutdown failed", "error", err)
+					} else {
+						slog.Info("HTTP server shutdown complete.")
+					}
+				}()
+			}
+
+			// Shutdown admin server
 			if adminServer != nil {
 				wg.Add(1)
 				go func() {
@@ -188,18 +244,6 @@ func main() {
 						slog.Warn("Admin server shutdown failed", "error", err)
 					} else {
 						slog.Info("Admin server shutdown complete.")
-					}
-				}()
-			}
-
-			if autocertServer != nil {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					if err := autocertServer.Shutdown(ctx); err != nil {
-						slog.Warn("Autocert server shutdown failed", "error", err)
-					} else {
-						slog.Info("Autocert server shutdown complete.")
 					}
 				}()
 			}
@@ -215,7 +259,6 @@ func main() {
 				slog.Error("Failed to reload config", "error", err)
 			} else {
 				loadBalancer.ReloadConfig(newCfg)
-				slog.Info("Configuration successfully reloaded")
 			}
 		}
 	}
