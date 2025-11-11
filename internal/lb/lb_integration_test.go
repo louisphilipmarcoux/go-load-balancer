@@ -329,10 +329,10 @@ func TestL4_UDPProxy(t *testing.T) {
 	buffer := make([]byte, 1024)
 	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		// In a test, you might want to fail the test
-		t.Fatalf("Failed to set read deadline: %v", err) 
+		t.Fatalf("Failed to set read deadline: %v", err)
 		// In real code (like udp_proxy.go), you'd log and return
 		// slog.Warn("Failed to set read deadline", "error", err)
-		// return 
+		// return
 	}
 	n, err := conn.Read(buffer)
 	if err != nil {
