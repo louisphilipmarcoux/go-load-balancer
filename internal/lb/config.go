@@ -6,9 +6,41 @@ import (
 	"os"
 	"time"
 
-	"github.com/caarlos0/env/v9" // NEW
+	"github.com/caarlos0/env/v9"
 	"gopkg.in/yaml.v3"
 )
+
+// ListenerConfig holds settings for a single entrypoint
+type ListenerConfig struct {
+	Name       string           `yaml:"name"`     // e.g., "web-https", "postgres-tcp"
+	Protocol   string           `yaml:"protocol"` // "http", "https", "tcp", "udp"
+	ListenAddr string           `yaml:"listenAddr"`
+	TLS        *TLSConfig       `yaml:"tls,omitempty"`
+	Autocert   *AutocertConfig  `yaml:"autocert,omitempty"`
+	RateLimit  *RateLimitConfig `yaml:"rateLimit,omitempty"` // L7
+	Cache      *CacheConfig     `yaml:"cache,omitempty"`     // L7
+	Routes     []*RouteConfig   `yaml:"routes,omitempty"`    // L7
+	Strategy   string           `yaml:"strategy,omitempty"`  // L4
+	Backends   []*BackendConfig `yaml:"backends,omitempty"`  // L4
+	Service    string           `yaml:"service,omitempty"`   // L4
+}
+
+// Config is the top-level configuration
+type Config struct {
+	// NEW: Listeners holds all listener configurations
+	Listeners []*ListenerConfig `yaml:"listeners"`
+
+	// GLOBAL SETTINGS (Shared by all listeners/services)
+	MetricsAddr    string                `yaml:"metricsAddr"    env:"METRICS_ADDR"`
+	AdminAddr      string                `yaml:"adminAddr"      env:"ADMIN_ADDR"`
+	AdminToken     string                `yaml:"adminToken"     env:"ADMIN_TOKEN"`
+	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
+	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
+	Redis          *RedisConfig          `yaml:"redis"`
+	Consul         *ConsulConfig         `yaml:"consul"`
+}
+
+// --- Other structs are mostly unchanged ---
 
 type ConsulConfig struct {
 	Addr string `env:"CONSUL_ADDR"`
@@ -18,23 +50,6 @@ type RedisConfig struct {
 	Addr     string `env:"REDIS_ADDR"`
 	Password string `env:"REDIS_PASSWORD"`
 	DB       int    `env:"REDIS_DB"`
-}
-
-// Config is the top-level configuration
-type Config struct {
-	ListenAddr     string                `yaml:"listenAddr"     env:"LISTEN_ADDR"`
-	MetricsAddr    string                `yaml:"metricsAddr"    env:"METRICS_ADDR"`
-	AdminAddr      string                `yaml:"adminAddr"      env:"ADMIN_ADDR"`
-	AdminToken     string                `yaml:"adminToken"     env:"ADMIN_TOKEN"` // NEW ENV TAG
-	TLS            *TLSConfig            `yaml:"tls"`
-	Autocert       *AutocertConfig       `yaml:"autocert"`
-	RateLimit      *RateLimitConfig      `yaml:"rateLimit"`
-	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
-	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
-	Cache          *CacheConfig          `yaml:"cache"`
-	Redis          *RedisConfig          `yaml:"redis"`
-	Consul         *ConsulConfig         `yaml:"consul"`
-	Routes         []*RouteConfig        `yaml:"routes"`
 }
 
 type TLSConfig struct {
@@ -47,11 +62,10 @@ type TLSConfig struct {
 type AutocertConfig struct {
 	Enabled  bool     `yaml:"enabled"  env:"AUTOCERT_ENABLED"`
 	Email    string   `yaml:"email"    env:"AUTOCERT_EMAIL"`
-	Domains  []string `yaml:"domains"  env:"AUTOCERT_DOMAINS" envSeparator:","` // Comma-separated
+	Domains  []string `yaml:"domains"  env:"AUTOCERT_DOMAINS" envSeparator:","`
 	CacheDir string   `yaml:"cacheDir" env:"AUTOCERT_CACHE_DIR"`
 }
 
-// ... (Add env tags to all other config structs as well) ...
 type RateLimitConfig struct {
 	Enabled           bool    `yaml:"enabled"           env:"RATE_LIMIT_ENABLED"`
 	RequestsPerSecond float64 `yaml:"requestsPerSecond" env:"RATE_LIMIT_RPS"`
@@ -73,7 +87,6 @@ type CacheConfig struct {
 	CleanupInterval   time.Duration `yaml:"cleanupInterval"    env:"CACHE_CLEANUP_INTERVAL"`
 }
 
-// ... (RouteConfig and BackendConfig are unchanged, as they are lists) ...
 type RouteConfig struct {
 	Host     string            `yaml:"host"     json:"host,omitempty"`
 	Path     string            `yaml:"path"     json:"path"`
@@ -87,18 +100,16 @@ type BackendConfig struct {
 	Weight int    `yaml:"weight" json:"weight"`
 }
 
-// LoadConfig now reads from YAML *and* overrides with Env Vars
+// LoadConfig function is unchanged
 func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 
-	// 1. Load from YAML file first
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open config file: %w", err)
 	}
 	defer func() {
 		if err := file.Close(); err != nil {
-			// Use standard log here, as slog isn't set up yet
 			log.Printf("Warning: failed to close config file: %v", err)
 		}
 	}()
@@ -107,17 +118,13 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to decode config YAML: %w", err)
 	}
 
-	// Manually initialize the RedisConfig struct if it's nil.
-	// This allows env.Parse to populate it even if it's not in the YAML.
 	if cfg.Redis == nil {
 		cfg.Redis = &RedisConfig{}
 	}
-
 	if cfg.Consul == nil {
 		cfg.Consul = &ConsulConfig{}
 	}
 
-	// 2. NEW: Override with environment variables
 	if err := env.Parse(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse env vars: %w", err)
 	}

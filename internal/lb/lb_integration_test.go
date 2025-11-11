@@ -16,7 +16,7 @@ import (
 	"github.com/louisphilipmarcoux/go-load-balancer/internal/backend"
 )
 
-// ... (Constants - no changes) ...
+// Constants are UNCHANGED
 const (
 	lbAddr         = "localhost:8443"
 	metricsAddr    = "localhost:9090"
@@ -30,7 +30,7 @@ const (
 
 var testClient *http.Client
 
-// ... (waitForPort - no changes) ...
+// waitForPort is UNCHANGED
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -48,7 +48,7 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
-// CHANGED: TestMain now adds ConnectionPool config
+// TestMain is CHANGED to use the new Config struct
 func TestMain(m *testing.M) {
 	// ... (Backend startup - no changes) ...
 	apiListener, err := backend.RunServer("9091", backendID_API)
@@ -67,53 +67,66 @@ func TestMain(m *testing.M) {
 	}
 	defer func() { _ = webListener.Close() }()
 
+	// CHANGED: Use the new Config struct
 	cfg := &Config{
-		ListenAddr:  lbAddr,
 		MetricsAddr: metricsAddr,
-		TLS: &TLSConfig{
-			CertFile: "../../server.crt",
-			KeyFile:  "../../server.key",
-		},
-		// NEW: Add a (small) connection pool for testing
 		ConnectionPool: &ConnectionPoolConfig{
 			MaxIdleConns:        10,
 			MaxIdleConnsPerHost: 5,
 			IdleConnTimeout:     30 * time.Second,
 		},
-		Routes: []*RouteConfig{
+		Listeners: []*ListenerConfig{
 			{
-				Host:     "api.example.com",
-				Path:     "/",
-				Strategy: "round-robin",
-				Backends: []*BackendConfig{{Addr: backendAddrAPI, Weight: 1}},
-			},
-			{
-				Path:     "/",
-				Headers:  map[string]string{"User-Agent": "MobileApp"},
-				Strategy: "round-robin",
-				Backends: []*BackendConfig{{Addr: backendAddrMob, Weight: 1}},
-			},
-			{
-				Path:     "/",
-				Strategy: "round-robin",
-				Backends: []*BackendConfig{{Addr: backendAddrWeb, Weight: 1}},
+				Name:       "integration-test-listener",
+				Protocol:   "https",
+				ListenAddr: lbAddr,
+				TLS: &TLSConfig{
+					CertFile: "../../server.crt",
+					KeyFile:  "../../server.key",
+				},
+				Routes: []*RouteConfig{
+					{
+						Host:     "api.example.com",
+						Path:     "/",
+						Strategy: "round-robin",
+						Backends: []*BackendConfig{{Addr: backendAddrAPI, Weight: 1}},
+					},
+					{
+						Path:     "/",
+						Headers:  map[string]string{"User-Agent": "MobileApp"},
+						Strategy: "round-robin",
+						Backends: []*BackendConfig{{Addr: backendAddrMob, Weight: 1}},
+					},
+					{
+						Path:     "/",
+						Strategy: "round-robin",
+						Backends: []*BackendConfig{{Addr: backendAddrWeb, Weight: 1}},
+					},
+				},
 			},
 		},
 	}
 
-	// ... (LB startup - no changes) ...
 	lb := NewLoadBalancer(cfg)
+	// Manually set health for testing
 	lb.routes[0].pool.backends[0].SetHealth(true)
 	lb.routes[1].pool.backends[0].SetHealth(true)
 	lb.routes[2].pool.backends[0].SetHealth(true)
-	server := &http.Server{Addr: cfg.ListenAddr, Handler: lb}
+
+	// CHANGED: Get listener config for starting server
+	listenerCfg := cfg.Listeners[0]
+	server := &http.Server{Addr: listenerCfg.ListenAddr, Handler: lb}
 	go func() {
-		if err := server.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.ListenAndServeTLS(listenerCfg.TLS.CertFile, listenerCfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("LB server exited: %v", err)
 		}
 	}()
 	defer func() { _ = server.Shutdown(context.Background()) }()
+
+	// Start metrics server
 	go StartMetricsServer(cfg.MetricsAddr, lb)
+
+	// ... (Rest of TestMain is UNCHANGED) ...
 	ports := []string{backendAddrAPI, backendAddrMob, backendAddrWeb, lbAddr, metricsAddr}
 	for _, port := range ports {
 		if err := waitForPort(port, 2*time.Second); err != nil {
@@ -129,7 +142,9 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// ... (All other tests - TestL7Routing, TestBackendHealth, etc. - are UNCHANGED) ...
+// --- All other tests (TestL7Routing, TestBackendHealth, etc.) ---
+// --- are completely UNCHANGED. ---
+
 func TestL7Routing(t *testing.T) {
 	reqWeb, _ := http.NewRequest("GET", "https://"+lbAddr+"/", nil)
 	respWeb, err := testClient.Do(reqWeb)

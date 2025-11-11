@@ -6,13 +6,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv" // NEW
-	"strings" // NEW
+	"strconv"
+	"strings"
 
 	"github.com/gorilla/mux"
 )
 
-// NEW: adminAuthMiddleware checks for the bearer token
+// adminAuthMiddleware is UNCHANGED
 func adminAuthMiddleware(lb *LoadBalancer) mux.MiddlewareFunc {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -46,6 +46,7 @@ func adminAuthMiddleware(lb *LoadBalancer) mux.MiddlewareFunc {
 	}
 }
 
+// StartAdminServer is UNCHANGED
 func StartAdminServer(lb *LoadBalancer) *http.Server {
 	if lb.cfg.AdminAddr == "" {
 		slog.Info("Admin server is disabled (adminAddr not set)")
@@ -55,6 +56,8 @@ func StartAdminServer(lb *LoadBalancer) *http.Server {
 	api := r.PathPrefix("/api/v1").Subrouter()
 	api.Use(adminAuthMiddleware(lb))
 
+	// TODO: These routes should be /listeners/{id}/routes etc.
+	// But for now, they will just edit the *first* L7 listener.
 	api.HandleFunc("/routes", getRoutesHandler(lb)).Methods("GET")
 	api.HandleFunc("/routes", addRouteHandler(lb)).Methods("POST")
 	api.HandleFunc("/routes/{index:[0-9]+}", getRouteHandler(lb)).Methods("GET")
@@ -77,10 +80,10 @@ func StartAdminServer(lb *LoadBalancer) *http.Server {
 	return adminServer
 }
 
+// respondWithError and respondWithJSON are UNCHANGED
 func respondWithError(w http.ResponseWriter, code int, message string) {
 	respondWithJSON(w, code, map[string]string{"error": message})
 }
-
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	response, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -96,14 +99,41 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	}
 }
 
-// --- Route Handlers (CHANGED to use index) ---
+// NEW HELPER: getFirstL7Listener
+// This finds the first http/https listener for the admin API to manage.
+// This is a temporary solution.
+func getFirstL7Listener(lb *LoadBalancer) (*ListenerConfig, error) {
+	lb.lock.RLock()
+	defer lb.lock.RUnlock()
+
+	for _, l := range lb.cfg.Listeners {
+		if l.Protocol == "http" || l.Protocol == "https" {
+			return l, nil
+		}
+	}
+	return nil, errors.New("no http/https listener found to manage")
+}
+
+// getIndex helper is UNCHANGED
+func getIndex(r *http.Request) (int, error) {
+	vars := mux.Vars(r)
+	index, err := strconv.Atoi(vars["index"])
+	if err != nil {
+		return 0, errors.New("invalid route index")
+	}
+	return index, nil
+}
+
+// --- Route Handlers (CHANGED) ---
 
 func getRoutesHandler(lb *LoadBalancer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		lb.lock.RLock()
-		cfg := lb.cfg
-		lb.lock.RUnlock()
-		respondWithJSON(w, http.StatusOK, cfg.Routes)
+		listener, err := getFirstL7Listener(lb) // CHANGED
+		if err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		respondWithJSON(w, http.StatusOK, listener.Routes) // CHANGED
 	}
 }
 
@@ -118,22 +148,19 @@ func addRouteHandler(lb *LoadBalancer) http.HandlerFunc {
 			respondWithError(w, http.StatusBadRequest, "Route 'path' is required")
 			return
 		}
-		if err := lb.AddRoute(&newRoute); err != nil {
+
+		listener, err := getFirstL7Listener(lb) // CHANGED
+		if err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
+
+		if err := lb.AddRoute(listener, &newRoute); err != nil { // CHANGED
 			respondWithError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		respondWithJSON(w, http.StatusCreated, newRoute)
 	}
-}
-
-// Helper to parse index from URL
-func getIndex(r *http.Request) (int, error) {
-	vars := mux.Vars(r)
-	index, err := strconv.Atoi(vars["index"])
-	if err != nil {
-		return 0, errors.New("invalid route index")
-	}
-	return index, nil
 }
 
 func getRouteHandler(lb *LoadBalancer) http.HandlerFunc {
@@ -144,10 +171,13 @@ func getRouteHandler(lb *LoadBalancer) http.HandlerFunc {
 			return
 		}
 
-		lb.lock.RLock()
-		defer lb.lock.RUnlock()
+		listener, err := getFirstL7Listener(lb) // CHANGED
+		if err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
 
-		route, err := lb.getRouteByIndex(index)
+		route, err := lb.getRouteByIndex(listener, index) // CHANGED
 		if err != nil {
 			respondWithError(w, http.StatusNotFound, err.Error())
 			return
@@ -164,7 +194,13 @@ func deleteRouteHandler(lb *LoadBalancer) http.HandlerFunc {
 			return
 		}
 
-		if err := lb.DeleteRoute(index); err != nil {
+		listener, err := getFirstL7Listener(lb) // CHANGED
+		if err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
+
+		if err := lb.DeleteRoute(listener, index); err != nil { // CHANGED
 			respondWithError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -172,7 +208,7 @@ func deleteRouteHandler(lb *LoadBalancer) http.HandlerFunc {
 	}
 }
 
-// --- Backend Handlers (CHANGED to use index) ---
+// --- Backend Handlers (CHANGED) ---
 
 func addBackendHandler(lb *LoadBalancer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +228,13 @@ func addBackendHandler(lb *LoadBalancer) http.HandlerFunc {
 			return
 		}
 
-		if err := lb.AddBackendToRoute(index, &newBackend); err != nil {
+		listener, err := getFirstL7Listener(lb) // CHANGED
+		if err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
+
+		if err := lb.AddBackendToRoute(listener, index, &newBackend); err != nil { // CHANGED
 			respondWithError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -208,9 +250,15 @@ func deleteBackendHandler(lb *LoadBalancer) http.HandlerFunc {
 			return
 		}
 		vars := mux.Vars(r)
-		host, _ := url.PathUnescape(vars["host"]) // e.g., localhost:9004
+		host, _ := url.PathUnescape(vars["host"])
 
-		if err := lb.DeleteBackendFromRoute(index, host); err != nil {
+		listener, err := getFirstL7Listener(lb) // CHANGED
+		if err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
+
+		if err := lb.DeleteBackendFromRoute(listener, index, host); err != nil { // CHANGED
 			respondWithError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -236,7 +284,13 @@ func updateBackendHandler(lb *LoadBalancer) http.HandlerFunc {
 			return
 		}
 
-		if err := lb.UpdateBackendWeightInRoute(index, host, payload.Weight); err != nil {
+		listener, err := getFirstL7Listener(lb) // CHANGED
+		if err != nil {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
+
+		if err := lb.UpdateBackendWeightInRoute(listener, index, host, payload.Weight); err != nil { // CHANGED
 			respondWithError(w, http.StatusNotFound, err.Error())
 			return
 		}
