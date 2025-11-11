@@ -9,6 +9,6 @@ type ServiceDiscoverer interface {
 		serviceName string,
 		pool *BackendPool,
 		cbCfg *CircuitBreakerConfig,
-		poolCfg *ConnectionPoolConfig,
+		poolCfg *ConnectionPoolConfig, // nil for L4
 	)
 }

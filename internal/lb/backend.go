@@ -13,8 +13,7 @@ import (
 	"github.com/sony/gobreaker"
 )
 
-// Backend struct and its methods (IsHealthy, SetHealth, etc.)
-// are completely UNCHANGED.
+// Backend struct and its methods
 type Backend struct {
 	Addr          string
 	healthy       bool
@@ -47,7 +46,7 @@ func (b *Backend) GetConnections() uint64 {
 	return atomic.LoadUint64(&b.connections)
 }
 
-// BackendPool struct is UNCHANGED
+// BackendPool struct
 type BackendPool struct {
 	backends []*Backend
 	strategy string
@@ -57,11 +56,10 @@ type BackendPool struct {
 
 // --- L7 Backend Functions ---
 
-// newL7Backend (was newBackend)
+// newL7Backend creates an L7 (HTTP) backend
 func (p *BackendPool) newL7Backend(
 	beConfig *BackendConfig,
 	cbCfg *CircuitBreakerConfig,
-	poolCfg *ConnectionPoolConfig,
 	transport *http.Transport,
 ) *Backend {
 
@@ -114,7 +112,7 @@ func (p *BackendPool) newL7Backend(
 	}
 }
 
-// NewL7BackendPool (was NewBackendPool)
+// NewL7BackendPool creates a pool of L7 backends
 func NewL7BackendPool(
 	routeCfg *RouteConfig,
 	discoverer ServiceDiscoverer,
@@ -144,7 +142,7 @@ func NewL7BackendPool(
 	return pool
 }
 
-// buildL7Backends (was buildBackends)
+// buildL7Backends populates the pool with L7 backends
 func (p *BackendPool) buildL7Backends(
 	backendConfigs map[string]*BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -163,14 +161,14 @@ func (p *BackendPool) buildL7Backends(
 
 	backends := make([]*Backend, 0, len(backendConfigs))
 	for _, bc := range backendConfigs {
-		if be := p.newL7Backend(bc, cbCfg, poolCfg, transport); be != nil {
+		if be := p.newL7Backend(bc, cbCfg, transport); be != nil {
 			backends = append(backends, be)
 		}
 	}
 	p.backends = backends
 }
 
-// UpdateL7Backends (was UpdateBackends)
+// UpdateL7Backends atomically updates the pool with L7 backends
 func (p *BackendPool) UpdateL7Backends(
 	newBackends map[string]*BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -207,7 +205,7 @@ func (p *BackendPool) UpdateL7Backends(
 			finalBackends = append(finalBackends, existing)
 		} else {
 			slog.Info("Service discovery: new L7 backend found", "addr", addr)
-			if be := p.newL7Backend(beConfig, cbCfg, poolCfg, transport); be != nil {
+			if be := p.newL7Backend(beConfig, cbCfg, transport); be != nil {
 				be.SetHealth(true)
 				finalBackends = append(finalBackends, be)
 			}
@@ -226,9 +224,9 @@ func (p *BackendPool) UpdateL7Backends(
 	slog.Info("L7 Backend pool updated via service discovery", "service", p.strategy, "count", len(p.backends))
 }
 
-// --- NEW: L4 Backend Functions ---
+// --- L4 Backend Functions ---
 
-// newL4Backend is a simplified version for TCP/UDP
+// newL4Backend creates an L4 (TCP/UDP) backend
 func (p *BackendPool) newL4Backend(
 	beConfig *BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -254,7 +252,6 @@ func (p *BackendPool) newL4Backend(
 		cb = gobreaker.NewCircuitBreaker(st)
 	}
 
-	// No proxy, no URL parsing
 	return &Backend{
 		Addr:   beConfig.Addr,
 		Weight: weight,
@@ -262,7 +259,7 @@ func (p *BackendPool) newL4Backend(
 	}
 }
 
-// NewL4BackendPool creates a pool for a TCP/UDP listener
+// NewL4BackendPool creates a pool of L4 backends
 func NewL4BackendPool(
 	listenerCfg *ListenerConfig,
 	discoverer ServiceDiscoverer,
@@ -274,25 +271,41 @@ func NewL4BackendPool(
 		backends: make([]*Backend, 0),
 	}
 
+	// --- THIS IS THE FIX ---
+	// We check the protocol before deciding on health check logic
 	if listenerCfg.Service != "" {
 		if discoverer == nil {
 			slog.Error("Service discovery configured but discoverer is nil", "service", listenerCfg.Service)
 			return pool
 		}
-		// Note: We pass nil for ConnectionPoolConfig as L4 doesn't use it
 		discoverer.WatchService(listenerCfg.Service, pool, cbCfg, nil)
+		// We still have a problem: discovered UDP backends will be marked
+		// healthy, but static ones won't. This logic needs refinement,
+		// but let's fix the static case first.
 	} else {
 		staticBackends := make(map[string]*BackendConfig)
 		for _, bc := range listenerCfg.Backends {
 			staticBackends[bc.Addr] = bc
 		}
 		pool.buildL4Backends(staticBackends, cbCfg)
-		pool.StartHealthChecks()
+
+		// --- THIS IS THE FIX ---
+		switch listenerCfg.Protocol {
+case "tcp":
+			pool.StartHealthChecks()
+		case "udp":
+			// For UDP, we can't do a TCP dial.
+			// Assume healthy for now.
+			slog.Warn("Skipping health checks for UDP listener, marking all backends as healthy", "listener", listenerCfg.Name)
+			for _, b := range pool.backends {
+				b.SetHealth(true)
+			}
+		}
 	}
 	return pool
 }
 
-// buildL4Backends creates L4 backends
+// buildL4Backends populates the pool with L4 backends
 func (p *BackendPool) buildL4Backends(
 	backendConfigs map[string]*BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -306,7 +319,7 @@ func (p *BackendPool) buildL4Backends(
 	p.backends = backends
 }
 
-// UpdateL4Backends updates L4 backends from service discovery
+// UpdateL4Backends atomically updates the pool with L4 backends
 func (p *BackendPool) UpdateL4Backends(
 	newBackends map[string]*BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -350,9 +363,9 @@ func (p *BackendPool) UpdateL4Backends(
 	slog.Info("L4 Backend pool updated via service discovery", "service", p.strategy, "count", len(p.backends))
 }
 
-// --- Common Functions (Unchanged) ---
+// --- Common Functions ---
 
-// healthCheck (Unchanged)
+// healthCheck performs a simple TCP dial
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -373,7 +386,7 @@ func (p *BackendPool) healthCheck(b *Backend) {
 	}
 }
 
-// StartHealthChecks (Unchanged)
+// StartHealthChecks starts health checks for static backends
 func (p *BackendPool) StartHealthChecks() {
 	if len(p.backends) == 0 {
 		slog.Debug("Skipping health checks for service discovery pool")
@@ -400,7 +413,7 @@ func (p *BackendPool) StartHealthChecks() {
 	}()
 }
 
-// GetTotalConnections (Unchanged)
+// GetTotalConnections returns the sum of active connections for all backends
 func (p *BackendPool) GetTotalConnections() uint64 {
 	var total uint64
 	for _, b := range p.backends {

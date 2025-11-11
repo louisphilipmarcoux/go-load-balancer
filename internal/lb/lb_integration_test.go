@@ -16,21 +16,24 @@ import (
 	"github.com/louisphilipmarcoux/go-load-balancer/internal/backend"
 )
 
-// Constants are UNCHANGED
+// --- Constants ---
 const (
-	lbAddr         = "localhost:8443"
-	metricsAddr    = "localhost:9090"
-	backendAddrAPI = "localhost:9091"
+	lbAddr         = "127.0.0.1:8443"
+	lbUdpAddr      = "127.0.0.1:8125"
+	metricsAddr    = "127.0.0.1:9090"
+	backendAddrAPI = "127.0.0.1:9091"
 	backendID_API  = "API-Server-1"
-	backendAddrMob = "localhost:9092"
+	backendAddrMob = "127.0.0.1:9092"
 	backendID_Mob  = "Mobile-Server-1"
-	backendAddrWeb = "localhost:9093"
+	backendAddrWeb = "127.0.0.1:9093"
 	backendID_Web  = "Web-Server-1"
+	backendAddrUDP = "127.0.0.1:9094"
+	backendID_UDP  = "UDP-Server-1"
 )
 
 var testClient *http.Client
 
-// waitForPort is UNCHANGED
+// waitForPort
 func waitForPort(addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -48,9 +51,9 @@ func waitForPort(addr string, timeout time.Duration) error {
 	}
 }
 
-// TestMain is CHANGED to use the new Config struct
+// TestMain
 func TestMain(m *testing.M) {
-	// ... (Backend startup - no changes) ...
+	// --- Start HTTP Backends ---
 	apiListener, err := backend.RunServer("9091", backendID_API)
 	if err != nil {
 		log.Fatalf("Failed to start API backend: %v", err)
@@ -67,7 +70,14 @@ func TestMain(m *testing.M) {
 	}
 	defer func() { _ = webListener.Close() }()
 
-	// CHANGED: Use the new Config struct
+	// --- Start UDP Backend ---
+	udpListener, err := backend.RunUDPServer("9094", backendID_UDP)
+	if err != nil {
+		log.Fatalf("Failed to start UDP backend: %v", err)
+	}
+	defer func() { _ = udpListener.Close() }()
+
+	// --- Config ---
 	cfg := &Config{
 		MetricsAddr: metricsAddr,
 		ConnectionPool: &ConnectionPoolConfig{
@@ -76,8 +86,9 @@ func TestMain(m *testing.M) {
 			IdleConnTimeout:     30 * time.Second,
 		},
 		Listeners: []*ListenerConfig{
+			// L7 HTTPS Listener
 			{
-				Name:       "integration-test-listener",
+				Name:       "integration-test-https",
 				Protocol:   "https",
 				ListenAddr: lbAddr,
 				TLS: &TLSConfig{
@@ -104,35 +115,92 @@ func TestMain(m *testing.M) {
 					},
 				},
 			},
+			// L4 UDP Listener
+			{
+				Name:       "integration-test-udp",
+				Protocol:   "udp",
+				ListenAddr: lbUdpAddr,
+				Strategy:   "round-robin",
+				Backends: []*BackendConfig{
+					{Addr: backendAddrUDP, Weight: 1},
+				},
+			},
 		},
 	}
 
-	lb := NewLoadBalancer(cfg)
-	// Manually set health for testing
-	lb.routes[0].pool.backends[0].SetHealth(true)
-	lb.routes[1].pool.backends[0].SetHealth(true)
-	lb.routes[2].pool.backends[0].SetHealth(true)
+	// --- Start Load Balancer ---
+	loadBalancer := NewLoadBalancer(cfg)
 
-	// CHANGED: Get listener config for starting server
-	listenerCfg := cfg.Listeners[0]
-	server := &http.Server{Addr: listenerCfg.ListenAddr, Handler: lb}
-	go func() {
-		if err := server.ListenAndServeTLS(listenerCfg.TLS.CertFile, listenerCfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("LB server exited: %v", err)
+	// --- THIS IS THE FIX ---
+	// The incorrect line setting health has been REMOVED.
+	// The new logic in NewL4BackendPool handles this automatically.
+
+	var httpServers []*http.Server
+	var tcpProxies []*TcpProxy
+	var udpProxies []*UDPProxy
+
+	for _, listenerCfg := range cfg.Listeners {
+		switch listenerCfg.Protocol {
+		case "http", "https":
+			var tlsConfig *tls.Config
+			if listenerCfg.TLS != nil {
+				tlsConfig = &tls.Config{}
+			}
+			server := &http.Server{
+				Addr:      listenerCfg.ListenAddr,
+				Handler:   loadBalancer,
+				TLSConfig: tlsConfig,
+			}
+			go func() {
+				if err := server.ListenAndServeTLS(listenerCfg.TLS.CertFile, listenerCfg.TLS.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					log.Printf("LB test server exited: %v", err)
+				}
+			}()
+			httpServers = append(httpServers, server)
+
+		case "tcp":
+			proxy, err := NewTcpProxy(listenerCfg, loadBalancer)
+			if err != nil {
+				log.Fatalf("Failed to create TCP proxy for test: %v", err)
+			}
+			tcpProxies = append(tcpProxies, proxy)
+			go proxy.Run()
+		case "udp":
+			proxy, err := NewUDPProxy(listenerCfg, loadBalancer)
+			if err != nil {
+				log.Fatalf("Failed to create UDP proxy for test: %v", err)
+			}
+			udpProxies = append(udpProxies, proxy)
+			go proxy.Run()
+		}
+	}
+
+	// Add graceful shutdown for all test servers
+	defer func() {
+		for _, srv := range httpServers {
+			_ = srv.Shutdown(context.Background())
+		}
+		for _, proxy := range tcpProxies {
+			proxy.Shutdown()
+			proxy.Wait()
+		}
+		for _, proxy := range udpProxies {
+			proxy.Shutdown()
+			proxy.Wait()
 		}
 	}()
-	defer func() { _ = server.Shutdown(context.Background()) }()
 
 	// Start metrics server
-	go StartMetricsServer(cfg.MetricsAddr, lb)
+	go StartMetricsServer(cfg.MetricsAddr, loadBalancer)
 
-	// ... (Rest of TestMain is UNCHANGED) ...
-	ports := []string{backendAddrAPI, backendAddrMob, backendAddrWeb, lbAddr, metricsAddr}
-	for _, port := range ports {
+	// Wait for TCP ports to be ready
+	tcpPorts := []string{backendAddrAPI, backendAddrMob, backendAddrWeb, lbAddr, metricsAddr}
+	for _, port := range tcpPorts {
 		if err := waitForPort(port, 2*time.Second); err != nil {
 			log.Fatalf("Server on %s failed to start: %v", port, err)
 		}
 	}
+
 	testClient = &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -142,9 +210,33 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// --- All other tests (TestL7Routing, TestBackendHealth, etc.) ---
-// --- are completely UNCHANGED. ---
+// --- TestL4_UDPProxy ---
+func TestL4_UDPProxy(t *testing.T) {
+	conn, err := net.Dial("udp", lbUdpAddr)
+	if err != nil {
+		t.Fatalf("Failed to dial UDP load balancer: %v", err)
+	}
+	defer conn.Close()
 
+	msg := []byte("Hello UDP")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("Failed to write UDP packet: %v", err)
+	}
+
+	buffer := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := conn.Read(buffer)
+	if err != nil {
+		t.Fatalf("Failed to read UDP response: %v", err)
+	}
+
+	expectedResponse := "Hello from UDP server: " + backendID_UDP
+	if string(buffer[:n]) != expectedResponse {
+		t.Errorf("Expected UDP response %q, got %q", expectedResponse, string(buffer[:n]))
+	}
+}
+
+// --- All other tests (TestL7Routing, TestBackendHealth, etc.) are UNCHANGED. ---
 func TestL7Routing(t *testing.T) {
 	reqWeb, _ := http.NewRequest("GET", "https://"+lbAddr+"/", nil)
 	respWeb, err := testClient.Do(reqWeb)

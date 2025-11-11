@@ -15,7 +15,6 @@ type RateLimiter struct {
 }
 
 // NewRateLimiter connects to Redis
-// CHANGED: The signature now takes the specific configs it needs
 func NewRateLimiter(rlCfg *RateLimitConfig, redisCfg *RedisConfig) *RateLimiter {
 	if redisCfg == nil {
 		slog.Error("Redis is not configured, but rate limiting is enabled.")
@@ -41,28 +40,24 @@ func NewRateLimiter(rlCfg *RateLimitConfig, redisCfg *RedisConfig) *RateLimiter 
 	slog.Info("Connected to Redis for global rate limiting")
 	return &RateLimiter{
 		client: rdb,
-		limit:  int(rlCfg.RequestsPerSecond), // Use rlCfg
+		limit:  int(rlCfg.RequestsPerSecond),
 	}
 }
 
 // Allow checks if a request from a given IP is allowed
-// This implements a "Fixed Window" algorithm
 func (rl *RateLimiter) Allow(ip string) bool {
 	ctx := context.Background()
 	key := "ratelimit:" + ip
 
-	// Use a pipeline to make the INCR and EXPIRE commands atomic
 	pipe := rl.client.Pipeline()
 	count := pipe.Incr(ctx, key)
-	pipe.Expire(ctx, key, 1*time.Second) // Set expiration for this 1-second window
+	pipe.Expire(ctx, key, 1*time.Second)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		slog.Warn("Failed to execute Redis rate limit pipeline", "error", err)
-		// Fail open (allow request) if Redis fails
-		return true
+		return true // Fail open
 	}
 
-	// Check if the count exceeds the limit
 	if count.Val() > int64(rl.limit) {
 		return false // Deny request
 	}

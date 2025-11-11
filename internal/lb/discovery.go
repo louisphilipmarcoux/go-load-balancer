@@ -8,12 +8,12 @@ import (
 	consul "github.com/hashicorp/consul/api"
 )
 
-// ConsulClient struct (Unchanged)
+// ConsulClient wraps the Consul API client (implements ServiceDiscoverer)
 type ConsulClient struct {
 	client *consul.Client
 }
 
-// NewConsulClient (Unchanged)
+// NewConsulClient creates and pings a new Consul client
 func NewConsulClient(addr string) (ServiceDiscoverer, error) {
 	config := consul.DefaultConfig()
 	config.Address = addr
@@ -21,15 +21,18 @@ func NewConsulClient(addr string) (ServiceDiscoverer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create consul client: %w", err)
 	}
+
+	// Ping Consul to ensure connectivity
 	if _, err := client.Agent().Self(); err != nil {
 		return nil, fmt.Errorf("failed to connect to consul: %w", err)
 	}
+
 	slog.Info("Connected to Consul for service discovery", "addr", addr)
 	return &ConsulClient{client: client}, nil
 }
 
-// WatchService (CHANGED)
-// Now decides which update function to call
+// WatchService polls Consul for changes to a service and updates a BackendPool
+// It now decides whether to call the L7 or L4 update function.
 func (c *ConsulClient) WatchService(
 	serviceName string,
 	pool *BackendPool,
@@ -67,7 +70,7 @@ func (c *ConsulClient) WatchService(
 				newBackends[be.Addr] = be
 			}
 
-			// --- THIS IS THE NEW LOGIC ---
+			// THIS IS THE NEW LOGIC
 			if poolCfg != nil {
 				// We have a pool config, so this is L7
 				pool.UpdateL7Backends(newBackends, cbCfg, poolCfg)

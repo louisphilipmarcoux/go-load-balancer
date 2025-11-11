@@ -12,11 +12,9 @@ import (
 )
 
 // GetNextBackend selects a backend using the pool's strategy
-// CHANGED: Signature now takes clientIP
 func (p *BackendPool) GetNextBackend(r *http.Request, clientIP string) *Backend {
 	switch p.strategy {
 	case "ip-hash":
-		// Use the provided clientIP
 		if clientIP == "" {
 			slog.Warn("IP for ip-hash is empty, falling back", "fallback", "round-robin")
 			return p.GetNextBackendByRoundRobin()

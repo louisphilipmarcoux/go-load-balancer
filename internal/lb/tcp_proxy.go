@@ -94,6 +94,7 @@ func (p *TcpProxy) handleTcpConnection(clientConn net.Conn) {
 	// Use circuit breaker if available
 	if backend.cb != nil {
 		_, err := backend.cb.Execute(func() (interface{}, error) {
+			// Proxy the connection
 			return nil, p.proxyTcp(logger, clientConn, backend)
 		})
 		if err != nil {
@@ -102,9 +103,10 @@ func (p *TcpProxy) handleTcpConnection(clientConn net.Conn) {
 			} else {
 				logger.Warn("Circuit breaker failure recorded", "error", err)
 			}
-			return
+			return // Don't proxy if circuit is open or call failed
 		}
 	} else {
+		// No circuit breaker, just proxy
 		if err := p.proxyTcp(logger, clientConn, backend); err != nil {
 			logger.Warn("TCP proxy error", "error", err)
 		}

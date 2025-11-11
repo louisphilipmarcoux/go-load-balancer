@@ -11,7 +11,6 @@ import (
 )
 
 // newTestLoadBalancer creates a minimal LB for testing handlers.
-// CHANGED: Uses the new Config struct
 func newTestLoadBalancer() *LoadBalancer {
 	cfg := &Config{
 		AdminToken: "test-token",
@@ -29,7 +28,7 @@ func newTestLoadBalancer() *LoadBalancer {
 	return lb
 }
 
-// TestAdminAuthMiddleware is UNCHANGED
+// TestAdminAuthMiddleware
 func TestAdminAuthMiddleware(t *testing.T) {
 	lb := newTestLoadBalancer()
 
@@ -76,7 +75,7 @@ func TestAdminAuthMiddleware(t *testing.T) {
 	})
 }
 
-// getRoutesHandler is UNCHANGED (logic is tested, not the struct)
+// TestGetRoutesHandler
 func TestGetRoutesHandler(t *testing.T) {
 	lb := newTestLoadBalancer()
 	req := httptest.NewRequest("GET", "/api/v1/routes", nil)
@@ -102,7 +101,7 @@ func TestGetRoutesHandler(t *testing.T) {
 	}
 }
 
-// TestAddBackendHandler is UNCHANGED (logic is tested)
+// TestAddBackendHandler
 func TestAddBackendHandler(t *testing.T) {
 	lb := newTestLoadBalancer()
 

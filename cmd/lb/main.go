@@ -19,7 +19,6 @@ import (
 )
 
 // --- Helper functions (getTLSVersion, getCipherSuites, startAutocertChallengeServer) ---
-// --- are UNCHANGED ---
 func getTLSVersion(version string) uint16 {
 	switch version {
 	case "tls1.0":
@@ -70,7 +69,7 @@ func startAutocertChallengeServer(certManager *autocert.Manager) *http.Server {
 	return server
 }
 
-// startHttpListener is UNCHANGED
+// startHttpListener
 func startHttpListener(listenerCfg *lb.ListenerConfig, loadBalancer *lb.LoadBalancer) (mainServer *http.Server, autocertServer *http.Server) {
 	var tlsConfig *tls.Config
 	if listenerCfg.Autocert != nil && listenerCfg.Autocert.Enabled {
@@ -118,9 +117,8 @@ func startHttpListener(listenerCfg *lb.ListenerConfig, loadBalancer *lb.LoadBala
 	return server, autocertServer
 }
 
-// main() is CHANGED to support graceful TCP shutdown
 func main() {
-	// --- Logger and Config setup (Unchanged) ---
+	// --- Logger and Config setup ---
 	logLevel := new(slog.LevelVar)
 	logLevel.Set(slog.LevelInfo)
 	if os.Getenv("LOG_LEVEL") == "DEBUG" {
@@ -137,7 +135,7 @@ func main() {
 
 	loadBalancer := lb.NewLoadBalancer(cfg)
 
-	// --- Global Services (Unchanged) ---
+	// --- Global Services ---
 	if cfg.MetricsAddr != "" {
 		go lb.StartMetricsServer(cfg.MetricsAddr, loadBalancer)
 	}
@@ -146,9 +144,10 @@ func main() {
 		adminServer = lb.StartAdminServer(loadBalancer)
 	}
 
-	// --- Listener Loop (CHANGED) ---
+	// --- Listener Loop ---
 	var httpServers []*http.Server
 	var tcpProxies []*lb.TcpProxy
+	var udpProxies []*lb.UDPProxy
 
 	for _, listenerCfg := range cfg.Listeners {
 		listenerCfg := listenerCfg // Capture loop variable
@@ -168,18 +167,23 @@ func main() {
 				continue
 			}
 			tcpProxies = append(tcpProxies, proxy)
-			go proxy.Run() // Start the proxy's accept loop
+			go proxy.Run()
 
 		case "udp":
-			slog.Info("Starting UDP listener (NYI)", "name", listenerCfg.Name, "addr", listenerCfg.ListenAddr)
-			// go startUdpListener(listenerCfg, loadBalancer) // For Milestone 3
+			proxy, err := lb.NewUDPProxy(listenerCfg, loadBalancer)
+			if err != nil {
+				slog.Error("Failed to create UDP proxy", "name", listenerCfg.Name, "error", err)
+				continue
+			}
+			udpProxies = append(udpProxies, proxy)
+			go proxy.Run()
 
 		default:
 			slog.Error("Unknown listener protocol, skipping", "name", listenerCfg.Name, "protocol", listenerCfg.Protocol)
 		}
 	}
 
-	// --- Signal Handling (CHANGED) ---
+	// --- Signal Handling ---
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
@@ -191,18 +195,28 @@ func main() {
 			defer cancel()
 			var wg sync.WaitGroup
 
-			// --- NEW: Shutdown TCP Proxies ---
-			// Step 1: Close listeners to stop accepting new connections
+			// --- Shutdown UDP Proxies ---
+			for _, proxy := range udpProxies {
+				proxy.Shutdown()
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for _, proxy := range udpProxies {
+					proxy.Wait()
+				}
+				slog.Info("All UDP listeners shut down.")
+			}()
+
+			// --- Shutdown TCP Proxies ---
 			for _, proxy := range tcpProxies {
 				proxy.Shutdown()
 			}
-
-			// Step 2: Add a goroutine to wait for active TCP connections to finish
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for _, proxy := range tcpProxies {
-					proxy.Wait() // Wait for all connections to close
+					proxy.Wait()
 				}
 				slog.Info("All TCP listeners shut down.")
 			}()
@@ -245,8 +259,6 @@ func main() {
 				slog.Error("Failed to reload config", "error", err)
 			} else {
 				loadBalancer.ReloadConfig(newCfg)
-				// A full reload would require restarting listeners,
-				// but this is sufficient for dynamic backend changes.
 			}
 		}
 	}

@@ -44,12 +44,12 @@ func (rt *Route) Matches(r *http.Request) bool {
 	return true
 }
 
-// LoadBalancer struct (CHANGED)
+// LoadBalancer struct
 type LoadBalancer struct {
 	cfg        *Config
 	discoverer ServiceDiscoverer
 	routes     []*Route                // L7 routes
-	l4Pools    map[string]*BackendPool // NEW: L4 pools, mapped by listener name
+	l4Pools    map[string]*BackendPool // L4 pools, mapped by listener name
 	rl         *RateLimiter
 	cache      *cache.Cache
 	lock       sync.RWMutex
@@ -76,13 +76,8 @@ func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
 		lb.discoverer = nil
 	}
 
-	// Rebuild L7 routes
 	newRoutes := lb.buildL7Routes(cfg)
-	// Rebuild L4 pools
 	newL4Pools := lb.buildL4Pools(cfg)
-
-	// Note: RL/Cache logic remains "first-listener-wins"
-	// This is not perfect, but acceptable for this milestone.
 
 	lb.cfg = cfg
 	lb.routes = newRoutes
@@ -98,7 +93,7 @@ func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 	slog.Info("Configuration successfully reloaded (safe)")
 }
 
-// NewLoadBalancer (CHANGED)
+// NewLoadBalancer (Unchanged)
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
 
@@ -111,7 +106,6 @@ func NewLoadBalancer(cfg *Config) *LoadBalancer {
 		}
 	}
 
-	// "First-listener-wins" logic for global L7 features
 	for _, l := range cfg.Listeners {
 		if l.Protocol == "http" || l.Protocol == "https" {
 			if l.RateLimit != nil && l.RateLimit.Enabled {
@@ -128,9 +122,7 @@ func NewLoadBalancer(cfg *Config) *LoadBalancer {
 		}
 	}
 
-	// Build L7 routes
 	lb.routes = lb.buildL7Routes(cfg)
-	// Build L4 pools
 	lb.l4Pools = lb.buildL4Pools(cfg)
 	lb.cfg = cfg
 
@@ -138,12 +130,13 @@ func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	return lb
 }
 
-// NEW: buildL4Pools
+// buildL4Pools (CHANGED)
 func (lb *LoadBalancer) buildL4Pools(cfg *Config) map[string]*BackendPool {
 	pools := make(map[string]*BackendPool)
 	for _, listenerCfg := range cfg.Listeners {
-		if listenerCfg.Protocol == "tcp" { // Will add "udp" in next milestone
-			slog.Info("Building L4 pool", "listener", listenerCfg.Name)
+		// CHANGED: Now includes "udp"
+		if listenerCfg.Protocol == "tcp" || listenerCfg.Protocol == "udp" {
+			slog.Info("Building L4 pool", "listener", listenerCfg.Name, "protocol", listenerCfg.Protocol)
 			pools[listenerCfg.Name] = NewL4BackendPool(
 				listenerCfg,
 				lb.discoverer,
@@ -154,7 +147,7 @@ func (lb *LoadBalancer) buildL4Pools(cfg *Config) map[string]*BackendPool {
 	return pools
 }
 
-// buildL7Routes (CHANGED)
+// buildL7Routes (Unchanged)
 func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
 	routes := make([]*Route, 0)
 	for _, listenerCfg := range cfg.Listeners {
@@ -164,7 +157,6 @@ func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
 
 		for _, routeCfg := range listenerCfg.Routes {
 			routeCfg := routeCfg // Capture loop variable
-			// CHANGED: Call NewL7BackendPool
 			pool := NewL7BackendPool(
 				routeCfg,
 				lb.discoverer,
@@ -205,7 +197,6 @@ func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
 					logger.Debug("Cache miss", "key", cacheKey)
 				}
 
-				// CHANGED: Pass client IP to GetNextBackend
 				clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 				backend := pool.GetNextBackend(r, clientIP)
 				if backend == nil {
@@ -291,7 +282,7 @@ func (lb *LoadBalancer) getRoutes() []*Route {
 	return lb.routes
 }
 
-// ServeHTTP (CHANGED)
+// ServeHTTP (Unchanged)
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqIDBytes := make([]byte, 6)
 	if _, err := rand.Read(reqIDBytes); err != nil {
@@ -329,7 +320,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// Admin API Helper Methods (Unchanged from previous fix)
+// --- Admin API Helper Methods (Unchanged) ---
 func (lb *LoadBalancer) getRouteByIndex(listener *ListenerConfig, index int) (*RouteConfig, error) {
 	if index < 0 || index >= len(listener.Routes) {
 		return nil, fmt.Errorf("route index %d out of bounds", index)
