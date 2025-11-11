@@ -62,7 +62,9 @@ func (p *TcpProxy) Run() {
 // Shutdown gracefully stops the TCP proxy
 func (p *TcpProxy) Shutdown() {
 	slog.Info("Closing TCP listener", "name", p.listenerName)
-	p.listener.Close() // This will break the Accept() loop in Run()
+	if err := p.listener.Close(); err != nil {
+		slog.Warn("Failed to close TCP listener", "name", p.listenerName, "error", err)
+	}
 }
 
 // Wait blocks until all active TCP connections are closed
@@ -74,7 +76,11 @@ func (p *TcpProxy) Wait() {
 // handleTcpConnection selects a backend and proxies the TCP connection
 func (p *TcpProxy) handleTcpConnection(clientConn net.Conn) {
 	defer p.wg.Done() // Decrement WaitGroup when connection is done
-	defer clientConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			slog.Warn("Failed to close client connection", "error", err)
+		}
+	}()
 
 	clientIP := clientConn.RemoteAddr().String()
 	logger := slog.Default().With(
@@ -120,7 +126,11 @@ func (p *TcpProxy) proxyTcp(logger *slog.Logger, clientConn net.Conn, backend *B
 		logger.Warn("Failed to connect to TCP backend", "error", err)
 		return err
 	}
-	defer backendConn.Close()
+	defer func() {
+		if err := backendConn.Close(); err != nil {
+			slog.Warn("Failed to close backend connection", "error", err)
+		}
+	}()
 
 	logger.Info("Proxying TCP connection")
 
@@ -133,7 +143,11 @@ func (p *TcpProxy) proxyTcp(logger *slog.Logger, clientConn net.Conn, backend *B
 	// Copy client -> backend
 	go func() {
 		defer wg.Done()
-		defer backendConn.Close()
+		defer func() {
+			if err := backendConn.Close(); err != nil {
+				slog.Warn("Failed to close backend connection during proxy", "error", err)
+			}
+		}()
 		_, err := io.Copy(backendConn, clientConn)
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Warn("TCP copy client->backend error", "error", err)
@@ -143,7 +157,11 @@ func (p *TcpProxy) proxyTcp(logger *slog.Logger, clientConn net.Conn, backend *B
 	// Copy backend -> client
 	go func() {
 		defer wg.Done()
-		defer clientConn.Close()
+		defer func() {
+			if err := clientConn.Close(); err != nil {
+				slog.Warn("Failed to close client connection during proxy", "error", err)
+			}
+		}()
 		_, err := io.Copy(clientConn, backendConn)
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			logger.Warn("TCP copy backend->client error", "error", err)

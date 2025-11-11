@@ -235,7 +235,11 @@ func TestL4_TCPProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to dial TCP load balancer: %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			slog.Warn("Failed to close connection", "error", err)
+		}
+	}()
 
 	// Send a simple HTTP GET request. We can do this because our
 	// test backend (RunServer) is an HTTP server.
@@ -311,7 +315,11 @@ func TestL4_UDPProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to dial UDP load balancer: %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			slog.Warn("Failed to close connection", "error", err)
+		}
+	}()
 
 	msg := []byte("Hello UDP")
 	if _, err := conn.Write(msg); err != nil {
@@ -319,7 +327,13 @@ func TestL4_UDPProxy(t *testing.T) {
 	}
 
 	buffer := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		// In a test, you might want to fail the test
+		t.Fatalf("Failed to set read deadline: %v", err) 
+		// In real code (like udp_proxy.go), you'd log and return
+		// slog.Warn("Failed to set read deadline", "error", err)
+		// return 
+	}
 	n, err := conn.Read(buffer)
 	if err != nil {
 		t.Fatalf("Failed to read UDP response: %v", err)

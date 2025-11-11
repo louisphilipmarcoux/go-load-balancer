@@ -53,7 +53,9 @@ func NewUDPProxy(listenerCfg *ListenerConfig, lb *LoadBalancer) (*UDPProxy, erro
 	sessionCache.OnEvicted(func(key string, i interface{}) {
 		if flow, ok := i.(*UDPFlow); ok {
 			slog.Debug("Closing expired UDP backend connection", "client", key, "backend", flow.backendConn.RemoteAddr())
-			flow.backendConn.Close() // Close the connection to the backend
+			if err := flow.backendConn.Close(); err != nil {
+				slog.Warn("Failed to close UDP backend connection on eviction", "client", key, "error", err)
+			}
 		}
 	})
 
@@ -82,7 +84,10 @@ func (p *UDPProxy) Run() {
 			return
 		default:
 			// Read a packet from the client
-			p.listener.SetReadDeadline(time.Now().Add(1 * time.Second))
+			if err := p.listener.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+				slog.Warn("Failed to set UDP read deadline", "name", p.listenerName, "error", err)
+				return // A real error, stop the loop
+			}
 			n, clientAddr, err := p.listener.ReadFromUDP(buffer)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -101,8 +106,10 @@ func (p *UDPProxy) Run() {
 // Shutdown gracefully stops the UDP proxy
 func (p *UDPProxy) Shutdown() {
 	slog.Info("Closing UDP listener", "name", p.listenerName)
-	close(p.stopChan)      // Signal the Run() loop to stop
-	p.listener.Close()     // Close the listener
+	close(p.stopChan) // Signal the Run() loop to stop
+	if err := p.listener.Close(); err != nil {
+		slog.Warn("Failed to close UDP listener", "name", p.listenerName, "error", err)
+	}
 	p.sessionCache.Flush() // This will trigger OnEvicted for all flows
 }
 
@@ -197,7 +204,11 @@ func (p *UDPProxy) proxyUdp(logger *slog.Logger, backend *Backend, clientAddr *n
 // listenForBackend runs in a goroutine, reading from a backend and writing to the client
 func (p *UDPProxy) listenForBackend(flow *UDPFlow, logger *slog.Logger) {
 	defer p.wg.Done()
-	defer flow.backendConn.Close()
+	defer func() {
+		if err := flow.backendConn.Close(); err != nil {
+			slog.Warn("Failed to close UDP backend connection", "error", err)
+		}
+	}()
 
 	// Find the backend in the pool to decrement its connection count later
 	var backend *Backend
@@ -214,7 +225,10 @@ func (p *UDPProxy) listenForBackend(flow *UDPFlow, logger *slog.Logger) {
 	buffer := make([]byte, 1500)
 	for {
 		// Set a deadline to check if the session is still valid
-		flow.backendConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		if err := flow.backendConn.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+			slog.Warn("Failed to set UDP backend read deadline", "backend", flow.backendConn.RemoteAddr(), "error", err)
+			return // A real error
+		}
 		n, err := flow.backendConn.Read(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
