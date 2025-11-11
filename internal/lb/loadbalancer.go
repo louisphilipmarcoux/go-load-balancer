@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 
@@ -272,6 +273,35 @@ func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
 			})
 		}
 	}
+
+	// Sort routes from most specific to least specific.
+	// This is CRITICAL so that routes with a 'Host' are
+	// matched before a generic 'path: "/"' route.
+	sort.Slice(routes, func(i, j int) bool {
+		r1 := routes[i].config
+		r2 := routes[j].config
+
+		// Rule 1: Host presence (routes with a host come first)
+		if r1.Host != "" && r2.Host == "" {
+			return true // r1 is more specific
+		}
+		if r1.Host == "" && r2.Host != "" {
+			return false // r2 is more specific
+		}
+
+		// Rule 2: Path length (longer paths come first)
+		// (Both have a host or both have no host, so compare path length)
+		if len(r1.Path) > len(r2.Path) {
+			return true // r1 is more specific
+		}
+		if len(r1.Path) < len(r2.Path) {
+			return false // r2 is more specific
+		}
+
+		// Rule 3: Host length (fallback for stable ordering)
+		return len(r1.Host) > len(r2.Host)
+	})
+
 	return routes
 }
 

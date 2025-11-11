@@ -1,35 +1,26 @@
 services:
-  # -------------------
-  # The Load Balancer
-  # -------------------
   lb:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: go-load-balancer
     ports:
-      # Map host ports to container ports
-      - "8443:8443" # Main traffic
-      - "9090:9090" # Metrics
-      - "9091:9091" # Admin
-      - "80:80"     # Autocert
+      - "8443:8443"
+      - "9090:9090"
+      - "9091:9091"
+      - "80:80"
     volumes:
-      # Mount your local config file directly into the container
-      - ./config.yaml:/config/config.yaml:ro
-      
-      # Mount your local certs (if using static TLS)
+      - ./config.e2e.yaml:/config.yaml:ro
       - ./server.crt:/certs/server.crt:ro
       - ./server.key:/certs/server.key:ro
-      
-      # Create a persistent volume for Autocert's cache
+      - ./startup-wrapper.sh:/startup-wrapper.sh:ro
       - autocert_cache:/certs
     environment:
-      # Set your log level and admin token from here
-      - LOG_LEVEL=${LOG_LEVEL}
+      - LOG_LEVEL=DEBUG
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - AUTOCERT_EMAIL=${AUTOCERT_EMAIL}
-      - REDIS_ADDR=redis:6379 # <-- ADD THIS
-      - REDIS_PASSWORD=        # <-- ADD THIS (empty for local)
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASSWORD=
       - REDIS_DB=0
       - CONSUL_ADDR=consul:8500
     depends_on:
@@ -43,51 +34,35 @@ services:
         condition: service_started
       consul:
         condition: service_healthy
-      registrator:
-        condition: service_started
+    
+    # Override user to run as root so we can install packages
+    user: root
+    # Use the startup wrapper script
+    entrypoint: ["/bin/sh", "/startup-wrapper.sh"]
 
-  # -------------------
-  # Backend Servers
-  # -------------------
   backend1:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    # This command starts the backend with a specific port and ID
-    # This port is INSIDE docker
     command: ["-port", "9001", "Server-1"]
-    # No 'ports' needed; the 'lb' service can reach it
-    # by its Docker service name ('backend1:9001')
-    labels:
-      - SERVICE_NAME=api-service
-      - SERVICE_TAGS=api,backend
 
   backend2:
     build:
       context: .
       dockerfile: Dockerfile.backend
     command: ["-port", "9002", "Server-2"]
-    labels:
-      - SERVICE_NAME=mobile-service
-      - SERVICE_TAGS=mobile,backend
 
   backend3:
     build:
       context: .
       dockerfile: Dockerfile.backend
     command: ["-port", "9003", "Server-3"]
-    labels:
-      - SERVICE_NAME=web-service
-      - SERVICE_TAGS=web,backend
 
-  # -------------------
-  # NEW: Redis Service
-  # -------------------
   redis:
     image: "redis:7-alpine"
     container_name: redis
     ports:
-      - "6379:6379" # Expose for local debugging if you want
+      - "6379:6379"
     command: redis-server --save 60 1 --loglevel warning
 
   consul:
@@ -96,25 +71,11 @@ services:
     ports:
       - "8500:8500"
     command: "agent -dev -client=0.0.0.0 -ui -node=consul-dev"
-    # NEW: This healthcheck tells other containers when Consul is ready
     healthcheck:
       test: ["CMD", "consul", "info"]
       interval: 5s
       timeout: 2s
       retries: 5
 
-  registrator:
-    image: "frjaraur/registrator:latest"
-    container_name: registrator
-    depends_on:
-      consul:
-        # Wait for the healthcheck to pass before starting
-        condition: service_healthy
-    volumes:
-      - "/var/run/docker.sock:/tmp/docker.sock"
-    # NEW: This is the corrected command
-    command: ["registrator", "-internal", "consul://consul:8500"]
-
-# Define the persistent volume for the cert cache
 volumes:
   autocert_cache:

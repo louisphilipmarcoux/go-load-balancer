@@ -24,6 +24,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-w" -o /go-load-balancer ./cmd/l
 # Use a minimal 'alpine' base image for a small, secure container.
 FROM alpine:3.20
 
+# INSTALL DEPENDENCIES FOR STARTUP SCRIPT
+RUN apk add --no-cache curl jq
+
 # Create a non-root user for security
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 

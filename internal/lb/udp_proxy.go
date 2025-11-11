@@ -143,46 +143,55 @@ func (p *UDPProxy) handleUDPPacket(clientAddr *net.UDPAddr, data []byte) {
 
 	logger = logger.With("backend_addr", backend.Addr)
 
-	// Execute via circuit breaker
-	// --- THIS IS THE FIX ---
-	// The anonymous function is now passed as an argument, not called.
-	_, err := backend.cb.Execute(func() (interface{}, error) {
-		// Dial the backend over UDP
-		backendConn, err := net.Dial("udp", backend.Addr)
+	// We must check if the circuit breaker is enabled for this backend
+	if backend.cb != nil {
+		_, err := backend.cb.Execute(func() (interface{}, error) {
+			return p.proxyUdp(logger, backend, clientAddr, data)
+		})
 		if err != nil {
-			logger.Warn("Failed to connect to UDP backend", "error", err)
-			return nil, err
+			if errors.Is(err, gobreaker.ErrOpenState) {
+				logger.Warn("UDP flow blocked by circuit breaker", "state", backend.cb.State().String())
+			} else {
+				logger.Warn("Circuit breaker failure for UDP", "error", err)
+			}
 		}
-
-		// Create the new flow
-		flow := &UDPFlow{
-			clientAddr:  clientAddr,
-			backendConn: backendConn,
-		}
-
-		// Start a new goroutine to listen for responses from this backend
-		p.wg.Add(1)
-		go p.listenForBackend(flow, logger)
-
-		// Add the new flow to the cache
-		p.sessionCache.Set(clientKey, flow, cache.DefaultExpiration)
-		logger.Info("Proxying new UDP flow")
-
-		// Increment connection count (for metrics/strategy)
-		backend.IncrementConnections()
-
-		// Write the first packet
-		_, err = backendConn.Write(data)
-		return nil, err
-	}) // --- The extra () were removed from here ---
-
-	if err != nil {
-		if errors.Is(err, gobreaker.ErrOpenState) {
-			logger.Warn("UDP flow blocked by circuit breaker", "state", backend.cb.State().String())
-		} else {
-			logger.Warn("Circuit breaker failure for UDP", "error", err)
+	} else {
+		// No circuit breaker, just proxy
+		if _, err := p.proxyUdp(logger, backend, clientAddr, data); err != nil {
+			logger.Warn("UDP proxy error", "error", err)
 		}
 	}
+}
+
+// proxyUdp contains the logic for creating a new UDP flow
+func (p *UDPProxy) proxyUdp(logger *slog.Logger, backend *Backend, clientAddr *net.UDPAddr, data []byte) (interface{}, error) {
+	// Dial the backend over UDP
+	backendConn, err := net.Dial("udp", backend.Addr)
+	if err != nil {
+		logger.Warn("Failed to connect to UDP backend", "error", err)
+		return nil, err
+	}
+
+	// Create the new flow
+	flow := &UDPFlow{
+		clientAddr:  clientAddr,
+		backendConn: backendConn,
+	}
+
+	// Start a new goroutine to listen for responses from this backend
+	p.wg.Add(1)
+	go p.listenForBackend(flow, logger)
+
+	// Add the new flow to the cache
+	p.sessionCache.Set(clientAddr.String(), flow, cache.DefaultExpiration)
+	logger.Info("Proxying new UDP flow")
+
+	// Increment connection count (for metrics/strategy)
+	backend.IncrementConnections()
+
+	// Write the first packet
+	_, err = backendConn.Write(data)
+	return nil, err
 }
 
 // listenForBackend runs in a goroutine, reading from a backend and writing to the client

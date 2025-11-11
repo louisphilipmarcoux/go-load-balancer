@@ -1,0 +1,37 @@
+# This config is for the E2E test. It uses the new listener format
+# and points to the Consul-discovered services from docker-compose.
+
+metricsAddr: ":9090"
+adminAddr: ":9091"
+
+# Global settings
+# We get secrets (ADMIN_TOKEN, REDIS_ADDR) from env vars in docker-compose
+consul:
+  addr: "consul:8500" # Internal Docker DNS name
+
+# Define the listeners
+listeners:
+  # L7 HTTPS Listener for the main app
+  - name: "e2e-https"
+    protocol: "https"
+    listenAddr: ":8443"
+    tls:
+      # The container mounts certs to these paths
+      certFile: "/certs/server.crt"
+      keyFile: "/certs/server.key"
+
+    # L7 Routes that use Consul service discovery
+    routes:
+      - host: "api.example.com"
+        path: "/"
+        strategy: "round-robin"
+        service: "api-service" # Name from backend1 label
+
+      - path: "/" # Default route
+        strategy: "round-robin"
+        service: "web-service" # Name from backend3 label
+
+  # L7 HTTP listener for Autocert (port must be open)
+  - name: "http-challenge"
+    protocol: "http"
+    listenAddr: ":80"

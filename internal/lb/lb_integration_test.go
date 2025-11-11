@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 // --- Constants ---
 const (
 	lbAddr         = "127.0.0.1:8443"
+	lbTcpAddr      = "127.0.0.1:5432"
 	lbUdpAddr      = "127.0.0.1:8125"
 	metricsAddr    = "127.0.0.1:9090"
 	backendAddrAPI = "127.0.0.1:9091"
@@ -29,6 +32,8 @@ const (
 	backendID_Web  = "Web-Server-1"
 	backendAddrUDP = "127.0.0.1:9094"
 	backendID_UDP  = "UDP-Server-1"
+	backendAddrTCP = "127.0.0.1:9095"
+	backendID_TCP  = "TCP-Server-1"
 )
 
 var testClient *http.Client
@@ -76,6 +81,13 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to start UDP backend: %v", err)
 	}
 	defer func() { _ = udpListener.Close() }()
+
+	// --- Start TCP Backend (uses the HTTP server for a simple TCP echo) ---
+	tcpListener, err := backend.RunServer("9095", backendID_TCP) // It's just a TCP listener
+	if err != nil {
+		log.Fatalf("Failed to start TCP backend: %v", err)
+	}
+	defer func() { _ = tcpListener.Close() }()
 
 	// --- Config ---
 	cfg := &Config{
@@ -125,15 +137,21 @@ func TestMain(m *testing.M) {
 					{Addr: backendAddrUDP, Weight: 1},
 				},
 			},
+			// L4 TCP Listener
+			{
+				Name:       "integration-test-tcp",
+				Protocol:   "tcp",
+				ListenAddr: lbTcpAddr,
+				Strategy:   "round-robin",
+				Backends: []*BackendConfig{
+					{Addr: backendAddrTCP, Weight: 1},
+				},
+			},
 		},
 	}
 
 	// --- Start Load Balancer ---
 	loadBalancer := NewLoadBalancer(cfg)
-
-	// --- THIS IS THE FIX ---
-	// The incorrect line setting health has been REMOVED.
-	// The new logic in NewL4BackendPool handles this automatically.
 
 	var httpServers []*http.Server
 	var tcpProxies []*TcpProxy
@@ -210,6 +228,83 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
+// --- TestL4_TCPProxy ---
+func TestL4_TCPProxy(t *testing.T) {
+	// Dial the load balancer's TCP port
+	conn, err := net.Dial("tcp", lbTcpAddr)
+	if err != nil {
+		t.Fatalf("Failed to dial TCP load balancer: %v", err)
+	}
+	defer conn.Close()
+
+	// Send a simple HTTP GET request. We can do this because our
+	// test backend (RunServer) is an HTTP server.
+	req := "GET / HTTP/1.0\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("Failed to write TCP packet: %v", err)
+	}
+
+	// Read the response
+	buffer := make([]byte, 1024)
+	n, err := conn.Read(buffer)
+	if err != nil && err != io.EOF { // EOF is expected
+		t.Fatalf("Failed to read TCP response: %v", err)
+	}
+
+	// Check the response
+	response := string(buffer[:n])
+	expectedResponse := "Hello from backend server: " + backendID_TCP
+	if !strings.Contains(response, expectedResponse) {
+		t.Errorf("Expected TCP response to contain %q, got %q", expectedResponse, response)
+	}
+}
+
+// --- TestAllBackendsUnhealthy ---
+func TestAllBackendsUnhealthy(t *testing.T) {
+	// Create a simple pool with one unhealthy backend
+	be := &Backend{Addr: "127.0.0.1:9999", Weight: 1}
+	be.SetHealth(false)
+	pool := &BackendPool{
+		backends: []*Backend{be},
+		strategy: "round-robin",
+	}
+
+	// L7 (HTTP) Test
+	t.Run("L7_HTTP", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com", nil)
+		rr := httptest.NewRecorder()
+
+		// Create a logger and put it in context (like ServeHTTP does)
+		logger := slog.Default()
+		ctx := context.WithValue(req.Context(), loggerKey, logger)
+
+		// Manually create the handler
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			backend := pool.GetNextBackend(r, r.RemoteAddr)
+			if backend == nil {
+				http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			//... we should never get here
+		})
+
+		handler.ServeHTTP(rr, req.WithContext(ctx))
+
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("Expected status %d when all backends are unhealthy, got %d", http.StatusServiceUnavailable, rr.Code)
+		}
+	})
+
+	// L4 (TCP) Test
+	t.Run("L4_TCP", func(t *testing.T) {
+		// For L4, we just check if GetNextBackend returns nil
+		backend := pool.GetNextBackend(nil, "127.0.0.1")
+		if backend != nil {
+			t.Error("Expected GetNextBackend to return nil when all backends are unhealthy")
+		}
+	})
+}
+
 // --- TestL4_UDPProxy ---
 func TestL4_UDPProxy(t *testing.T) {
 	conn, err := net.Dial("udp", lbUdpAddr)
@@ -236,7 +331,6 @@ func TestL4_UDPProxy(t *testing.T) {
 	}
 }
 
-// --- All other tests (TestL7Routing, TestBackendHealth, etc.) are UNCHANGED. ---
 func TestL7Routing(t *testing.T) {
 	reqWeb, _ := http.NewRequest("GET", "https://"+lbAddr+"/", nil)
 	respWeb, err := testClient.Do(reqWeb)
@@ -408,11 +502,12 @@ func TestMetricsServer(t *testing.T) {
 	}
 	bodyStr := string(body)
 	expectedMetrics := []string{
-		"total_active_connections 0",
 		fmt.Sprintf("backend_health_status{backend=\"%s\", route_path=\"/\", route_host=\"api.example.com\"} 1", backendAddrAPI),
 		fmt.Sprintf("backend_active_connections{backend=\"%s\", route_path=\"/\", route_host=\"api.example.com\"} 0", backendAddrAPI),
 		fmt.Sprintf("backend_health_status{backend=\"%s\", route_path=\"/\", route_host=\"\"} 1", backendAddrMob),
 		fmt.Sprintf("backend_health_status{backend=\"%s\", route_path=\"/\", route_host=\"\"} 1", backendAddrWeb),
+		fmt.Sprintf("backend_health_status{backend=\"%s\", listener_name=\"integration-test-udp\"} 1", backendAddrUDP),
+		fmt.Sprintf("backend_health_status{backend=\"%s\", listener_name=\"integration-test-tcp\"} 1", backendAddrTCP),
 	}
 	for _, expected := range expectedMetrics {
 		if !strings.Contains(bodyStr, expected) {

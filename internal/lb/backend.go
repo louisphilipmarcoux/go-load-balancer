@@ -130,7 +130,11 @@ func NewL7BackendPool(
 			slog.Error("Service discovery configured but discoverer is nil", "service", routeCfg.Service)
 			return pool
 		}
-		discoverer.WatchService(routeCfg.Service, pool, cbCfg, poolCfg)
+		poolCfgForWatch := poolCfg
+		if poolCfgForWatch == nil {
+			poolCfgForWatch = &ConnectionPoolConfig{}
+		}
+		discoverer.WatchService(routeCfg.Service, pool, cbCfg, poolCfgForWatch)
 	} else {
 		staticBackends := make(map[string]*BackendConfig)
 		for _, bc := range routeCfg.Backends {
@@ -291,7 +295,7 @@ func NewL4BackendPool(
 
 		// --- THIS IS THE FIX ---
 		switch listenerCfg.Protocol {
-case "tcp":
+		case "tcp":
 			pool.StartHealthChecks()
 		case "udp":
 			// For UDP, we can't do a TCP dial.
