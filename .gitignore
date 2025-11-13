@@ -19,3 +19,13 @@ certs/
 
 # Secrets
 .env
+config.yaml
+config.e2e.yaml
+config.prod.yaml
+config.k8s.yaml
+
+# Terraform state files
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfvars

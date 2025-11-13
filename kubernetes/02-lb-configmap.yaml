@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lb-config
+  namespace: golb
+data:
+  config.yaml: |
+    # Paste the *entire* contents of your config.k8s.yaml here
+    metricsAddr: ":9090"
+    adminAddr: ":9091"
+    listeners:
+      - name: "prod-https"
+        protocol: "https"
+        listenAddr: ":8443"
+        autocert:
+          enabled: true
+          email: "" 
+          # --- IMPORTANT ---
+          # Replace these with your real domains
+          domains:
+            - "lb.your-domain.com"
+            - "api.your-domain.com"
+          cacheDir: "/certs"
+        routes:
+          - host: "api.your-domain.com" # <-- Must match your domain
+            path: "/"
+            strategy: "round-robin"
+            backends:
+              - addr: "api-service.golb.svc.cluster.local:9001"
+                weight: 1
+          - path: "/"
+            strategy: "round-robin"
+            backends:
+              - addr: "web-service.golb.svc.cluster.local:9003"
+                weight: 1
+      - name: "http-challenge"
+        protocol: "http"
+        listenAddr: ":8080"

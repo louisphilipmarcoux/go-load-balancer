@@ -56,7 +56,7 @@ type BackendPool struct {
 
 // --- L7 Backend Functions ---
 
-// newL7Backend creates an L7 (HTTP) backend
+// newL7Backend (unchanged)
 func (p *BackendPool) newL7Backend(
 	beConfig *BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -112,10 +112,9 @@ func (p *BackendPool) newL7Backend(
 	}
 }
 
-// NewL7BackendPool creates a pool of L7 backends
+// NewL7BackendPool (CHANGED)
 func NewL7BackendPool(
 	routeCfg *RouteConfig,
-	discoverer ServiceDiscoverer,
 	cbCfg *CircuitBreakerConfig,
 	poolCfg *ConnectionPoolConfig,
 ) *BackendPool {
@@ -125,28 +124,18 @@ func NewL7BackendPool(
 		backends: make([]*Backend, 0),
 	}
 
-	if routeCfg.Service != "" {
-		if discoverer == nil {
-			slog.Error("Service discovery configured but discoverer is nil", "service", routeCfg.Service)
-			return pool
-		}
-		poolCfgForWatch := poolCfg
-		if poolCfgForWatch == nil {
-			poolCfgForWatch = &ConnectionPoolConfig{}
-		}
-		discoverer.WatchService(routeCfg.Service, pool, cbCfg, poolCfgForWatch)
-	} else {
-		staticBackends := make(map[string]*BackendConfig)
-		for _, bc := range routeCfg.Backends {
-			staticBackends[bc.Addr] = bc
-		}
-		pool.buildL7Backends(staticBackends, cbCfg, poolCfg)
-		pool.StartHealthChecks()
+	// Service discovery logic is removed
+	staticBackends := make(map[string]*BackendConfig)
+	for _, bc := range routeCfg.Backends {
+		staticBackends[bc.Addr] = bc
 	}
+	pool.buildL7Backends(staticBackends, cbCfg, poolCfg)
+	pool.StartHealthChecks()
+
 	return pool
 }
 
-// buildL7Backends populates the pool with L7 backends
+// buildL7Backends (unchanged)
 func (p *BackendPool) buildL7Backends(
 	backendConfigs map[string]*BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -172,65 +161,11 @@ func (p *BackendPool) buildL7Backends(
 	p.backends = backends
 }
 
-// UpdateL7Backends atomically updates the pool with L7 backends
-func (p *BackendPool) UpdateL7Backends(
-	newBackends map[string]*BackendConfig,
-	cbCfg *CircuitBreakerConfig,
-	poolCfg *ConnectionPoolConfig,
-) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	var transport *http.Transport
-	if poolCfg != nil {
-		transport = &http.Transport{
-			MaxIdleConns:        poolCfg.MaxIdleConns,
-			MaxIdleConnsPerHost: poolCfg.MaxIdleConnsPerHost,
-			IdleConnTimeout:     poolCfg.IdleConnTimeout,
-		}
-	} else {
-		transport = &http.Transport{}
-	}
-
-	currentBackends := make(map[string]*Backend)
-	finalBackends := make([]*Backend, 0, len(newBackends))
-
-	for _, be := range p.backends {
-		currentBackends[be.Addr] = be
-	}
-
-	for addr, beConfig := range newBackends {
-		if existing, ok := currentBackends[addr]; ok {
-			existing.Weight = beConfig.Weight
-			if existing.Weight == 0 {
-				existing.Weight = 1
-			}
-			existing.SetHealth(true)
-			finalBackends = append(finalBackends, existing)
-		} else {
-			slog.Info("Service discovery: new L7 backend found", "addr", addr)
-			if be := p.newL7Backend(beConfig, cbCfg, transport); be != nil {
-				be.SetHealth(true)
-				finalBackends = append(finalBackends, be)
-			}
-		}
-	}
-
-	for addr, be := range currentBackends {
-		if _, ok := newBackends[addr]; !ok {
-			slog.Warn("Service discovery: L7 backend removed", "addr", addr)
-			be.SetHealth(false)
-			finalBackends = append(finalBackends, be)
-		}
-	}
-
-	p.backends = finalBackends
-	slog.Info("L7 Backend pool updated via service discovery", "service", p.strategy, "count", len(p.backends))
-}
+// UpdateL7Backends is DELETED
 
 // --- L4 Backend Functions ---
 
-// newL4Backend creates an L4 (TCP/UDP) backend
+// newL4Backend (unchanged)
 func (p *BackendPool) newL4Backend(
 	beConfig *BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -263,10 +198,9 @@ func (p *BackendPool) newL4Backend(
 	}
 }
 
-// NewL4BackendPool creates a pool of L4 backends
+// NewL4BackendPool (CHANGED)
 func NewL4BackendPool(
 	listenerCfg *ListenerConfig,
-	discoverer ServiceDiscoverer,
 	cbCfg *CircuitBreakerConfig,
 ) *BackendPool {
 
@@ -275,41 +209,27 @@ func NewL4BackendPool(
 		backends: make([]*Backend, 0),
 	}
 
-	// --- THIS IS THE FIX ---
-	// We check the protocol before deciding on health check logic
-	if listenerCfg.Service != "" {
-		if discoverer == nil {
-			slog.Error("Service discovery configured but discoverer is nil", "service", listenerCfg.Service)
-			return pool
-		}
-		discoverer.WatchService(listenerCfg.Service, pool, cbCfg, nil)
-		// We still have a problem: discovered UDP backends will be marked
-		// healthy, but static ones won't. This logic needs refinement,
-		// but let's fix the static case first.
-	} else {
-		staticBackends := make(map[string]*BackendConfig)
-		for _, bc := range listenerCfg.Backends {
-			staticBackends[bc.Addr] = bc
-		}
-		pool.buildL4Backends(staticBackends, cbCfg)
+	// Service discovery logic is removed
+	staticBackends := make(map[string]*BackendConfig)
+	for _, bc := range listenerCfg.Backends {
+		staticBackends[bc.Addr] = bc
+	}
+	pool.buildL4Backends(staticBackends, cbCfg)
 
-		// --- THIS IS THE FIX ---
-		switch listenerCfg.Protocol {
-		case "tcp":
-			pool.StartHealthChecks()
-		case "udp":
-			// For UDP, we can't do a TCP dial.
-			// Assume healthy for now.
-			slog.Warn("Skipping health checks for UDP listener, marking all backends as healthy", "listener", listenerCfg.Name)
-			for _, b := range pool.backends {
-				b.SetHealth(true)
-			}
+	switch listenerCfg.Protocol {
+	case "tcp":
+		pool.StartHealthChecks()
+	case "udp":
+		slog.Warn("Skipping health checks for UDP listener, marking all backends as healthy", "listener", listenerCfg.Name)
+		for _, b := range pool.backends {
+			b.SetHealth(true)
 		}
 	}
+
 	return pool
 }
 
-// buildL4Backends populates the pool with L4 backends
+// buildL4Backends (unchanged)
 func (p *BackendPool) buildL4Backends(
 	backendConfigs map[string]*BackendConfig,
 	cbCfg *CircuitBreakerConfig,
@@ -323,53 +243,11 @@ func (p *BackendPool) buildL4Backends(
 	p.backends = backends
 }
 
-// UpdateL4Backends atomically updates the pool with L4 backends
-func (p *BackendPool) UpdateL4Backends(
-	newBackends map[string]*BackendConfig,
-	cbCfg *CircuitBreakerConfig,
-) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	currentBackends := make(map[string]*Backend)
-	finalBackends := make([]*Backend, 0, len(newBackends))
-
-	for _, be := range p.backends {
-		currentBackends[be.Addr] = be
-	}
-
-	for addr, beConfig := range newBackends {
-		if existing, ok := currentBackends[addr]; ok {
-			existing.Weight = beConfig.Weight
-			if existing.Weight == 0 {
-				existing.Weight = 1
-			}
-			existing.SetHealth(true)
-			finalBackends = append(finalBackends, existing)
-		} else {
-			slog.Info("Service discovery: new L4 backend found", "addr", addr)
-			if be := p.newL4Backend(beConfig, cbCfg); be != nil {
-				be.SetHealth(true)
-				finalBackends = append(finalBackends, be)
-			}
-		}
-	}
-
-	for addr, be := range currentBackends {
-		if _, ok := newBackends[addr]; !ok {
-			slog.Warn("Service discovery: L4 backend removed", "addr", addr)
-			be.SetHealth(false)
-			finalBackends = append(finalBackends, be)
-		}
-	}
-
-	p.backends = finalBackends
-	slog.Info("L4 Backend pool updated via service discovery", "service", p.strategy, "count", len(p.backends))
-}
+// UpdateL4Backends is DELETED
 
 // --- Common Functions ---
 
-// healthCheck performs a simple TCP dial
+// healthCheck (unchanged)
 func (p *BackendPool) healthCheck(b *Backend) {
 	conn, err := net.DialTimeout("tcp", b.Addr, 2*time.Second)
 	if err != nil {
@@ -390,10 +268,10 @@ func (p *BackendPool) healthCheck(b *Backend) {
 	}
 }
 
-// StartHealthChecks starts health checks for static backends
+// StartHealthChecks (CHANGED - simplified log)
 func (p *BackendPool) StartHealthChecks() {
 	if len(p.backends) == 0 {
-		slog.Debug("Skipping health checks for service discovery pool")
+		slog.Debug("Skipping health checks for empty pool")
 		return
 	}
 
@@ -417,7 +295,7 @@ func (p *BackendPool) StartHealthChecks() {
 	}()
 }
 
-// GetTotalConnections returns the sum of active connections for all backends
+// GetTotalConnections (unchanged)
 func (p *BackendPool) GetTotalConnections() uint64 {
 	var total uint64
 	for _, b := range p.backends {

@@ -1,0 +1,45 @@
+services:
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: go-load-balancer
+    # Use "host" networking to bind directly to the VM's 80/443 ports
+    network_mode: "host"
+    volumes:
+      - ./config.gcp.yaml:/config.yaml:ro
+      - autocert_cache:/certs
+    environment:
+      - LOG_LEVEL=DEBUG
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - AUTOCERT_EMAIL=${AUTOCERT_EMAIL}
+      - REDIS_ADDR=redis:6379 # Will connect to redis over host network
+    depends_on:
+      - backend1
+      - backend3
+      - redis
+    # We don't need 'user: root' or 'entrypoint'
+
+  backend1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["-port", "9001", "Server-1"]
+    # No ports needed, 'lb' will talk to it over internal Docker network
+
+  backend3:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["-port", "9003", "Server-3"]
+
+  redis:
+    image: "redis:7-alpine"
+    container_name: redis
+    # We must expose this to the host network so the 'lb' can find it
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+
+volumes:
+  autocert_cache:

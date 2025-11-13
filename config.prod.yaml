@@ -1,0 +1,43 @@
+# This is the PRODUCTION config.
+# It uses Autocert for real SSL and listens on 443/80.
+
+metricsAddr: ":9090"
+adminAddr: ":9091"
+
+# Global settings
+consul:
+  addr: "consul:8500" # Internal Docker DNS name
+
+# Define the listeners
+listeners:
+  # L7 HTTPS Listener for the main app
+  - name: "prod-https"
+    protocol: "https"
+    listenAddr: ":443"  # <-- CHANGED from :8443
+
+    # Autocert configuration
+    autocert:
+      enabled: true
+      # This will be read from the AUTOCERT_EMAIL env var
+      email: "" 
+      # These MUST be real domains you own
+      domains:
+        - "lb.your-domain.com"
+        - "api.your-domain.com"
+      cacheDir: "/certs" # Mounts to the 'autocert_cache' volume
+
+    # L7 Routes that use Consul service discovery
+    routes:
+      - host: "api.your-domain.com" # MUST be a real domain
+        path: "/"
+        strategy: "round-robin"
+        service: "api-service"
+
+      - path: "/" # Default route
+        strategy: "round-robin"
+        service: "web-service"
+
+  # L7 HTTP listener for Autocert (port must be open)
+  - name: "http-challenge"
+    protocol: "http"
+    listenAddr: ":80"
