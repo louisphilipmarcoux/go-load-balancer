@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lb-service
+  namespace: golb
+spec:
+  # This tells K8s to request a public IP from the cloud provider (OCI)
+  type: LoadBalancer
+  selector:
+    app: go-lb # Sends traffic to your go-lb pods
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80 # Public port
+      targetPort: 8080 # Container port for HTTP challenges
+    - name: https
+      protocol: TCP
+      port: 443 # Public port
+      targetPort: 8443 # Container port for your LB

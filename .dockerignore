@@ -13,6 +13,22 @@ cmd/backend/backend
 *.key
 *.crt
 config.yaml
+config.e2e.yaml
+config.prod.yaml
+config.k8s.yaml
+.env
 
 # Logs
 *.log
+
+# Infrastructure-as-Code files
+kubernetes/
+terraform/
+cloud-init.sh
+docker-compose.yaml
+startup-wrapper.sh
+test/
+test-e2e.sh
+
+# Cache
+autocert_cache/

@@ -47,13 +47,12 @@ func (rt *Route) Matches(r *http.Request) bool {
 
 // LoadBalancer struct
 type LoadBalancer struct {
-	cfg        *Config
-	discoverer ServiceDiscoverer
-	routes     []*Route                // L7 routes
-	l4Pools    map[string]*BackendPool // L4 pools, mapped by listener name
-	rl         *RateLimiter
-	cache      *cache.Cache
-	lock       sync.RWMutex
+	cfg     *Config
+	routes  []*Route                // L7 routes
+	l4Pools map[string]*BackendPool // L4 pools, mapped by listener name
+	rl      *RateLimiter
+	cache   *cache.Cache
+	lock    sync.RWMutex
 }
 
 // CacheItem (Unchanged)
@@ -65,18 +64,7 @@ type CacheItem struct {
 
 // reloadConfig_unsafe (CHANGED)
 func (lb *LoadBalancer) reloadConfig_unsafe(cfg *Config) {
-	if cfg.Consul != nil && cfg.Consul.Addr != "" {
-		discoverer, err := NewConsulClient(cfg.Consul.Addr)
-		if err != nil {
-			slog.Error("Failed to re-initialize Consul client", "error", err)
-			lb.discoverer = nil
-		} else {
-			lb.discoverer = discoverer
-		}
-	} else {
-		lb.discoverer = nil
-	}
-
+	// Consul logic is removed
 	newRoutes := lb.buildL7Routes(cfg)
 	newL4Pools := lb.buildL4Pools(cfg)
 
@@ -94,19 +82,11 @@ func (lb *LoadBalancer) ReloadConfig(cfg *Config) {
 	slog.Info("Configuration successfully reloaded (safe)")
 }
 
-// NewLoadBalancer (Unchanged)
+// NewLoadBalancer (CHANGED)
 func NewLoadBalancer(cfg *Config) *LoadBalancer {
 	lb := &LoadBalancer{}
 
-	if cfg.Consul != nil && cfg.Consul.Addr != "" {
-		discoverer, err := NewConsulClient(cfg.Consul.Addr)
-		if err != nil {
-			slog.Error("Failed to initialize Consul client, service discovery will fail", "error", err)
-		} else {
-			lb.discoverer = discoverer
-		}
-	}
-
+	// Consul logic is removed
 	for _, l := range cfg.Listeners {
 		if l.Protocol == "http" || l.Protocol == "https" {
 			if l.RateLimit != nil && l.RateLimit.Enabled {
@@ -135,12 +115,10 @@ func NewLoadBalancer(cfg *Config) *LoadBalancer {
 func (lb *LoadBalancer) buildL4Pools(cfg *Config) map[string]*BackendPool {
 	pools := make(map[string]*BackendPool)
 	for _, listenerCfg := range cfg.Listeners {
-		// CHANGED: Now includes "udp"
 		if listenerCfg.Protocol == "tcp" || listenerCfg.Protocol == "udp" {
 			slog.Info("Building L4 pool", "listener", listenerCfg.Name, "protocol", listenerCfg.Protocol)
 			pools[listenerCfg.Name] = NewL4BackendPool(
 				listenerCfg,
-				lb.discoverer,
 				cfg.CircuitBreaker,
 			)
 		}
@@ -148,7 +126,7 @@ func (lb *LoadBalancer) buildL4Pools(cfg *Config) map[string]*BackendPool {
 	return pools
 }
 
-// buildL7Routes (Unchanged)
+// buildL7Routes (CHANGED)
 func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
 	routes := make([]*Route, 0)
 	for _, listenerCfg := range cfg.Listeners {
@@ -160,12 +138,12 @@ func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
 			routeCfg := routeCfg // Capture loop variable
 			pool := NewL7BackendPool(
 				routeCfg,
-				lb.discoverer,
 				cfg.CircuitBreaker,
 				cfg.ConnectionPool,
 			)
 
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// ... (handler logic is unchanged) ...
 				logger, ok := r.Context().Value(loggerKey).(*slog.Logger)
 				if !ok {
 					logger = slog.Default()
@@ -274,45 +252,37 @@ func (lb *LoadBalancer) buildL7Routes(cfg *Config) []*Route {
 		}
 	}
 
-	// Sort routes from most specific to least specific.
-	// This is CRITICAL so that routes with a 'Host' are
-	// matched before a generic 'path: "/"' route.
+	// Sort routes (unchanged)
 	sort.Slice(routes, func(i, j int) bool {
 		r1 := routes[i].config
 		r2 := routes[j].config
-
-		// Rule 1: Host presence (routes with a host come first)
 		if r1.Host != "" && r2.Host == "" {
-			return true // r1 is more specific
+			return true
 		}
 		if r1.Host == "" && r2.Host != "" {
-			return false // r2 is more specific
+			return false
 		}
-
-		// Rule 2: Path length (longer paths come first)
-		// (Both have a host or both have no host, so compare path length)
 		if len(r1.Path) > len(r2.Path) {
-			return true // r1 is more specific
+			return true
 		}
 		if len(r1.Path) < len(r2.Path) {
-			return false // r2 is more specific
+			return false
 		}
-
-		// Rule 3: Host length (fallback for stable ordering)
 		return len(r1.Host) > len(r2.Host)
 	})
 
 	return routes
 }
 
-// getRoutes (Unchanged)
+// ... (ServeHTTP and Admin API helpers are all unchanged) ...
+// getRoutes
 func (lb *LoadBalancer) getRoutes() []*Route {
 	lb.lock.RLock()
 	defer lb.lock.RUnlock()
 	return lb.routes
 }
 
-// ServeHTTP (Unchanged)
+// ServeHTTP
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqIDBytes := make([]byte, 6)
 	if _, err := rand.Read(reqIDBytes); err != nil {

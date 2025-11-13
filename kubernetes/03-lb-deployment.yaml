@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lb-deployment
+  namespace: golb
+spec:
+  replicas: 2 # Run 2 instances for high availability
+  selector:
+    matchLabels:
+      app: go-lb
+  template:
+    metadata:
+      labels:
+        app: go-lb
+    spec:
+      containers:
+      - name: go-lb
+        # --- IMPORTANT ---
+        # Replace this with the path to your load balancer image in OCI Registry
+        image: <your-registry-path>/go-load-balancer:latest
+        ports:
+        - containerPort: 8443 # HTTPS
+        - containerPort: 8080 # HTTP
+        - containerPort: 9091 # Admin
+        env:
+        # These values will come from a K8s Secret
+        - name: ADMIN_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: lb-secrets
+              key: ADMIN_TOKEN
+        - name: AUTOCERT_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: lb-secrets
+              key: AUTOCERT_EMAIL
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        - name: cert-cache
+          mountPath: /certs
+      volumes:
+      - name: config-volume
+        configMap:
+          name: lb-config
+      - name: cert-cache
+        emptyDir: {} # For production, change to a PersistentVolumeClaim

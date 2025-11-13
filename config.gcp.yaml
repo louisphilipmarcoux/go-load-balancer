@@ -1,0 +1,45 @@
+# This is the GCP config.
+# It uses Autocert for SSL and a SINGLE domain with path-based routing.
+
+metricsAddr: ":9090"
+adminAddr: ":9091"
+
+# Define the listeners
+listeners:
+  # L7 HTTPS Listener for the main app
+  - name: "prod-https"
+    protocol: "https"
+    listenAddr: ":443"  # Listen on public port
+    
+    autocert:
+      enabled: true
+      email: "" # Will be injected by the .env file
+      domains:
+        # --- CHANGED ---
+        # List only your single domain here
+        - "go-lb.ddns.net" 
+
+    # L7 Routes that use static backends (Docker DNS)
+    routes:
+      # --- NEW API ROUTE (must be first) ---
+      # This route matches any request starting with /api/
+      - path: "/api/" 
+        strategy: "round-robin"
+        backends:
+          # This is the Docker container name from docker-compose
+          - addr: "backend1:9001"
+            weight: 1
+
+      # --- DEFAULT WEB ROUTE (must be last) ---
+      # This route matches everything else
+      - path: "/" 
+        strategy: "round-robin"
+        backends:
+          # This one points to a different backend container
+          - addr: "backend3:9003"
+            weight: 1
+  
+  # L7 HTTP listener for Autocert
+  - name: "http-challenge"
+    protocol: "http"
+    listenAddr: ":80" # Listen on public port

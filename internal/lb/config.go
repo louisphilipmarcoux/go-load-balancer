@@ -22,7 +22,6 @@ type ListenerConfig struct {
 	Routes     []*RouteConfig   `yaml:"routes,omitempty"`    // L7
 	Strategy   string           `yaml:"strategy,omitempty"`  // L4
 	Backends   []*BackendConfig `yaml:"backends,omitempty"`  // L4
-	Service    string           `yaml:"service,omitempty"`   // L4
 }
 
 // Config is the top-level configuration
@@ -37,14 +36,10 @@ type Config struct {
 	CircuitBreaker *CircuitBreakerConfig `yaml:"circuitBreaker"`
 	ConnectionPool *ConnectionPoolConfig `yaml:"connectionPool"`
 	Redis          *RedisConfig          `yaml:"redis"`
-	Consul         *ConsulConfig         `yaml:"consul"`
+	// Consul config is removed
 }
 
 // --- Other structs are mostly unchanged ---
-
-type ConsulConfig struct {
-	Addr string `env:"CONSUL_ADDR"`
-}
 
 type RedisConfig struct {
 	Addr     string `env:"REDIS_ADDR"`
@@ -93,7 +88,7 @@ type RouteConfig struct {
 	Headers  map[string]string `yaml:"headers"  json:"headers,omitempty"`
 	Strategy string            `yaml:"strategy" json:"strategy"`
 	Backends []*BackendConfig  `yaml:"backends" json:"backends"`
-	Service  string            `yaml:"service"  json:"service,omitempty"`
+	// Service field is removed
 }
 type BackendConfig struct {
 	Addr   string `yaml:"addr"   json:"addr"`
@@ -121,9 +116,7 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Redis == nil {
 		cfg.Redis = &RedisConfig{}
 	}
-	if cfg.Consul == nil {
-		cfg.Consul = &ConsulConfig{}
-	}
+	// Consul block is removed
 
 	if err := env.Parse(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse env vars: %w", err)
